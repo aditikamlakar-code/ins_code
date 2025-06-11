@@ -1,0 +1,237 @@
+# Import your main frequency model file
+# from your_module import FrequencyModel, train_frequency_model  # Adjust import path as needed
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import joblib
+import os
+
+# If running in Jupyter/Colab, for download functionality
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+def setup_feature_lists():
+    """
+    Define your feature lists for the frequency model
+    Customize these based on your actual data columns
+    """
+    
+    # Non-OHE features (numerical features that don't need one-hot encoding)
+    non_ohe_features = [
+        "DIRECT_OR_RT",
+        "HIST_LR_3YEAR", 
+        "DEVELOPMENT",
+        "FIN_RISK_SCR",
+        "LOG_NUM_SITES",
+        "LOG_TURNOVER", 
+        "LOG_EMPLOYEES",
+        "LOG_GMP"
+    ]
+    
+    # OHE features (categorical features that need one-hot encoding)
+    ohe_features = [
+        "TENURE",
+        "GCS_SEGMENT",
+        "BROKER_BAND",
+        "LOB_SUB_GROUP_2",
+        "LOB_SUB_GROUP_3"
+    ]
+    
+    return non_ohe_features, ohe_features
+
+def load_account_data():
+    """
+    Load your account data
+    Replace this with your actual data loading logic
+    """
+    
+    # Option 1: Load from CSV files
+    account_list_path = "path/to/your/account_list.csv"
+    # account_data = pd.read_csv(account_list_path)
+    
+    # Option 2: If you already have the data loaded
+    # account_data = your_existing_dataframe
+    
+    # Option 3: Example placeholder (replace with your actual data loading)
+    print("⚠️  Please update load_account_data() function with your actual data source")
+    print("   Current options:")
+    print("   1. Load from CSV: account_data = pd.read_csv('your_file.csv')")
+    print("   2. Use existing DataFrame: account_data = your_dataframe")
+    
+    # Return None for now - you'll replace this
+    return None
+
+def run_frequency_model():
+    """
+    Main function to run the frequency model training
+    """
+    
+    print("="*60)
+    print("FREQUENCY MODEL TRAINING RUNNER")
+    print("="*60)
+    
+    # 1. Setup feature lists
+    print("Step 1: Setting up feature lists...")
+    non_ohe_features, ohe_features = setup_feature_lists()
+    
+    print(f"Non-OHE features ({len(non_ohe_features)}): {non_ohe_features}")
+    print(f"OHE features ({len(ohe_features)}): {ohe_features}")
+    
+    # 2. Load account data
+    print("\nStep 2: Loading account data...")
+    account_data = load_account_data()
+    
+    if account_data is None:
+        print("❌ No account data loaded. Please update load_account_data() function.")
+        return None
+    
+    print(f"✅ Account data loaded: {account_data.shape}")
+    print(f"Columns: {list(account_data.columns)}")
+    
+    # 3. Initialize and train model
+    print("\nStep 3: Training frequency model...")
+    
+    # Option A: Using the convenience function
+    freq_model = train_frequency_model(
+        account_data=account_data,
+        non_ohe_features=non_ohe_features,
+        ohe_features=ohe_features,
+        n_trials=100,  # Adjust number of optimization trials
+        save_path=None  # We'll save manually below
+    )
+    
+    # Option B: Using the class directly (alternative)
+    # freq_model = FrequencyModel()
+    # results = freq_model.train_model(
+    #     account_data,
+    #     non_ohe_features,
+    #     ohe_features,
+    #     year_col='WRITN_YEAR',
+    #     n_trials=100
+    # )
+    
+    return freq_model
+
+def save_and_download_model(freq_model, model_name=None):
+    """
+    Save the trained model using joblib and provide download
+    """
+    
+    if freq_model is None:
+        print("❌ No trained model to save")
+        return
+    
+    # Generate model filename
+    if model_name is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = f"frequency_model_{timestamp}.joblib"
+    
+    if not model_name.endswith('.joblib'):
+        model_name += '.joblib'
+    
+    print(f"\nSaving model as: {model_name}")
+    
+    try:
+        # Save using joblib (already implemented in the main file)
+        freq_model.save_model(model_name)
+        
+        # Download functionality
+        if IN_COLAB:
+            print("📥 Downloading model file...")
+            files.download(model_name)
+        else:
+            print(f"✅ Model saved locally: {os.path.abspath(model_name)}")
+            
+        return model_name
+        
+    except Exception as e:
+        print(f"❌ Error saving model: {e}")
+        return None
+
+def load_saved_model(model_path):
+    """
+    Load a previously saved model
+    """
+    try:
+        freq_model = FrequencyModel()
+        freq_model.load_model(model_path)
+        print(f"✅ Model loaded from: {model_path}")
+        return freq_model
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return None
+
+# Main execution
+if __name__ == "__main__":
+    
+    # Run the complete training pipeline
+    trained_model = run_frequency_model()
+    
+    if trained_model is not None:
+        # Save and download the model
+        saved_model_path = save_and_download_model(trained_model)
+        
+        if saved_model_path:
+            print(f"\n🎉 Training completed successfully!")
+            print(f"📁 Model saved as: {saved_model_path}")
+            
+            # Print evaluation summary
+            trained_model.print_evaluation_summary()
+            
+            # Get feature importance
+            importance_df = trained_model.get_feature_importance()
+            print(f"\nTop 10 Important Features:")
+            print(importance_df.head(10)[['feature', 'importance_pct']])
+    
+    else:
+        print("❌ Training failed. Please check your data and configuration.")
+
+# For later: When you want to make predictions on new data
+# predictions = make_predictions("frequency_model_20240611_1620.joblib", "new_data.csv")
+
+# Optional: Prediction function for later use
+# Uncomment when you want to use your trained model for predictions
+
+# def make_predictions(model_path, new_data_path):
+#     """
+#     Use a saved model to make predictions on new data
+#     """
+#     # Load model
+#     freq_model = load_saved_model(model_path)
+#     if freq_model is None:
+#         return
+#     
+#     # Load new data
+#     new_data = pd.read_csv(new_data_path)
+#     
+#     # Get feature lists
+#     non_ohe_features, ohe_features = setup_feature_lists()
+#     all_features = non_ohe_features + ohe_features
+#     
+#     # Make predictions
+#     predictions = freq_model.predict(new_data, all_features)
+#     
+#     print(f"Predictions made for {len(predictions)} records")
+#     print(f"Average predicted frequency: {predictions.mean():.4f}")
+#     
+#     return predictions
+
+def validate_data_features(data_df):
+    """
+    Validate that your data has all required features
+    """
+    non_ohe_features, ohe_features = setup_feature_lists()
+    all_required = [f.upper() for f in non_ohe_features + ohe_features]
+    
+    data_cols = [col.upper() for col in data_df.columns]
+    missing = set(all_required) - set(data_cols)
+    
+    if missing:
+        print(f"❌ Missing required features: {missing}")
+        return False
+    else:
+        print(f"✅ All {len(all_required)} required features present")
+        return True
