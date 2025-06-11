@@ -1,0 +1,160 @@
+# Clean prediction script for saved frequency model
+import pandas as pd
+import numpy as np
+from frequency_model import FrequencyModel  # Your main model file
+
+def make_predictions(model_path, new_data_path, output_path=None):
+    """
+    Make predictions with saved model and show processed input data
+    """
+    
+    print("🚀 MAKING PREDICTIONS WITH SAVED MODEL")
+    print("="*50)
+    
+    # 1. Load saved model
+    print("1. Loading saved model...")
+    freq_model = FrequencyModel()
+    freq_model.load_model(model_path)
+    print(f"✅ Model loaded: {len(freq_model.feature_names)} features")
+    
+    # 2. Load new data
+    print("2. Loading new data...")
+    new_data = pd.read_csv(new_data_path)
+    print(f"✅ Data loaded: {new_data.shape}")
+    
+    # 3. Get training features from model metadata
+    training_features = freq_model.training_metadata.get('features', {})
+    non_ohe_features = training_features.get('non_ohe', [])
+    ohe_features = training_features.get('ohe', [])
+    all_features = [f.upper() for f in non_ohe_features + ohe_features]
+    
+    print(f"Required features: {len(all_features)}")
+    print(f"Non-OHE: {non_ohe_features}")
+    print(f"OHE: {ohe_features}")
+    
+    # 4. Prepare data (same as training)
+    print("3. Preparing data...")
+    new_data_prepared = new_data.rename(columns={col: col.upper() for col in new_data.columns})
+    
+    # Handle HIST_LR_3YEAR if present (same logic as training)
+    if "HIST_LR_3YEAR" in new_data_prepared.columns:
+        new_data_prepared["HIST_LR_3YEAR"] = new_data_prepared["HIST_LR_3YEAR"].apply(
+            lambda x: np.nan if pd.isna(x) else (1 if x > 1 else x)
+        )
+    
+    # Convert object columns to category
+    for col in new_data_prepared.select_dtypes(include=['object']).columns:
+        new_data_prepared[col] = new_data_prepared[col].astype('category')
+    
+    # 5. Validate all required features are present
+    missing_features = set(all_features) - set(new_data_prepared.columns)
+    if missing_features:
+        print(f"❌ Missing required features: {missing_features}")
+        print(f"Available features: {list(new_data_prepared.columns)}")
+        return None
+    
+    print("✅ All required features present")
+    
+    # 6. Show RAW input data that goes to model
+    print("\n📊 RAW INPUT DATA FOR MODEL:")
+    print("-" * 40)
+    feature_data = new_data_prepared[all_features]
+    print(f"Shape: {feature_data.shape}")
+    print(f"Columns: {list(feature_data.columns)}")
+    print("\nFirst 5 rows:")
+    print(feature_data.head())
+    
+    # 7. Apply preprocessing pipeline and show PROCESSED data
+    print(f"\n⚙️ APPLYING PREPROCESSING PIPELINE...")
+    processed_data = freq_model.preprocessor.transform(feature_data)
+    print(f"Processed shape: {processed_data.shape}")
+    
+    # Show processed data sample
+    print(f"\n📊 PROCESSED DATA (after sklearn pipeline):")
+    print("-" * 40)
+    processed_df = pd.DataFrame(processed_data, columns=freq_model.feature_names)
+    print("Final feature names (first 10):", freq_model.feature_names[:10])
+    print("\nFirst 5 rows of processed data:")
+    print(processed_df.head())
+    
+    print(f"\nProcessed data statistics:")
+    print(f"  Min values: {processed_data.min(axis=0)[:5]}")
+    print(f"  Max values: {processed_data.max(axis=0)[:5]}")
+    print(f"  Mean values: {processed_data.mean(axis=0)[:5]}")
+    
+    # 8. Make XGBoost predictions
+    print(f"\n🔮 MAKING XGBOOST PREDICTIONS...")
+    print(f"Calling XGBoost model.predict() on {processed_data.shape} data...")
+    
+    # Direct XGBoost prediction call
+    predictions = freq_model.model.predict(processed_data)
+    
+    print(f"✅ XGBoost predictions completed!")
+    print(f"  Records predicted: {len(predictions):,}")
+    print(f"  Average frequency: {predictions.mean():.6f}")
+    print(f"  Min prediction: {predictions.min():.6f}")
+    print(f"  Max prediction: {predictions.max():.6f}")
+    print(f"  Predictions > 0.5: {(predictions > 0.5).sum():,}")
+    print(f"  Predictions > 1.0: {(predictions > 1.0).sum():,}")
+    
+    # 9. Create results DataFrame
+    print(f"\n📄 CREATING RESULTS...")
+    results_df = new_data.copy()
+    results_df['predicted_frequency'] = predictions
+    results_df['predicted_claims_rounded'] = np.round(predictions).astype(int)
+    results_df['zero_claim_probability'] = np.exp(-predictions)  # P(X=0) for Poisson
+    
+    # 10. Save results if requested
+    if output_path:
+        results_df.to_csv(output_path, index=False)
+        print(f"✅ Results saved to: {output_path}")
+    
+    # 11. Summary
+    print(f"\n🎯 PREDICTION SUMMARY:")
+    print("=" * 30)
+    print(f"Total records: {len(predictions):,}")
+    print(f"Average frequency: {predictions.mean():.6f}")
+    print(f"Standard deviation: {predictions.std():.6f}")
+    
+    # Distribution of predictions
+    pred_rounded = np.round(predictions).astype(int)
+    print(f"\nPredicted claim distribution:")
+    for i in range(min(5, pred_rounded.max() + 1)):
+        count = (pred_rounded == i).sum()
+        pct = count / len(pred_rounded) * 100
+        print(f"  {i} claims: {count:,} accounts ({pct:.1f}%)")
+    
+    return results_df
+
+def quick_validate(data_path, model_path):
+    """Quick validation of data compatibility"""
+    print("🔍 VALIDATING DATA COMPATIBILITY")
+    print("-" * 30)
+    
+    # Load model to get required features
+    freq_model = FrequencyModel()
+    freq_model.load_model(model_path)
+    
+    # Load data
+    data = pd.read_csv(data_path)
+    data_upper = data.rename(columns={col: col.upper() for col in data.columns})
+    
+    # Get required features
+    training_features = freq_model.training_metadata.get('features', {})
+    required = [f.upper() for f in training_features.get('non_ohe', []) + training_features.get('ohe', [])]
+    
+    # Check for missing features
+    missing = set(required) - set(data_upper.columns)
+    
+    if missing:
+        print(f"❌ Missing required features:")
+        for feature in sorted(missing):
+            print(f"   - {feature}")
+        print(f"\n📋 Available features in your data:")
+        for feature in sorted(data_upper.columns):
+            print(f"   - {feature}")
+        return False
+    else:
+        print(f"✅ All {len(required)} required features present!")
+        print(f"Data shape: {data.shape}")
+        return True
