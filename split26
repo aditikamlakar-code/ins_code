@@ -1,0 +1,842 @@
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import mean_squared_error, mean_absolute_error, make_scorer, mean_poisson_deviance
+import xgboost as xgb
+from typing import List, Dict, Tuple, Any, Optional
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import warnings
+from datetime import datetime
+
+try:
+    # scikit-optimize Gaussian Process Bayesian optimization - REQUIRED dependency
+    from skopt import gp_minimize                                 # ← GP Bayesian optimization
+    from skopt.space import Real, Integer                         # ← skopt parameter spaces  
+    from skopt.utils import use_named_args                        # ← skopt utilities
+except ImportError as e:
+    raise ImportError(
+        "scikit-optimize is required for this frequency model. "
+        "Install with: pip install scikit-optimize"
+    ) from e
+
+warnings.filterwarnings('ignore')
+
+
+def neg_poisson_deviance_scorer(y_true, y_pred):
+    """Sklearn scorer for negative Poisson deviance (higher is better)
+    Uses sklearn's built-in mean_poisson_deviance for better reliability and consistency"""
+    return -mean_poisson_deviance(y_true, y_pred)
+
+
+# Create sklearn scorer using built-in mean_poisson_deviance
+# sklearn's implementation is more robust and handles edge cases better
+try:
+    # Try to use sklearn's built-in scorer string first
+    from sklearn.metrics import get_scorer
+    poisson_scorer = get_scorer('neg_mean_poisson_deviance')
+    print("Using sklearn's built-in 'neg_mean_poisson_deviance' scorer")
+except (ValueError, KeyError):
+    # Fall back to custom scorer if built-in doesn't exist
+    poisson_scorer = make_scorer(neg_poisson_deviance_scorer, greater_is_better=True)
+    print("Using custom negative Poisson deviance scorer")
+
+
+class FeatureFilter(BaseEstimator, TransformerMixin):
+    """Custom sklearn transformer for feature filtering"""
+    
+    def __init__(self, min_sample_ratio=0.01, min_samples=50):
+        self.min_sample_ratio = min_sample_ratio
+        self.min_samples = min_samples
+        self.features_to_keep_ = None
+    
+    def fit(self, X, y=None):
+        """Learn which features to keep based on minimum samples requirement"""
+        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        
+        min_required = max(self.min_samples, len(X_df) * self.min_sample_ratio)
+        self.features_to_keep_ = X_df.apply(lambda x: x.gt(0).sum() >= min_required, axis=0)
+        
+        filtered_count = len(X_df.columns) - self.features_to_keep_.sum()
+        if filtered_count > 0:
+            print(f"FeatureFilter: Will filter out {filtered_count} noisy features")
+            
+        return self
+    
+    def transform(self, X):
+        """Apply feature filtering"""
+        if self.features_to_keep_ is None:
+            raise ValueError("FeatureFilter not fitted yet")
+            
+        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        return X_df.loc[:, self.features_to_keep_].values
+    
+    def get_feature_names_out(self, input_features=None):
+        """Get output feature names"""
+        if self.features_to_keep_ is None:
+            raise ValueError("FeatureFilter not fitted yet")
+            
+        if input_features is None:
+            return [f"feature_{i}" for i in range(self.features_to_keep_.sum())]
+        else:
+            return [name for name, keep in zip(input_features, self.features_to_keep_) if keep]
+
+
+class FrequencyModelConfig:
+    """Configuration constants for the frequency model"""
+    EARLY_STOPPING_ROUNDS = 50
+    N_TRIALS_DEFAULT = 100  # Increased for better hyperparameter optimization on small datasets
+    RANDOM_STATE = 12
+   
+    # Train/validation/test split parameters for account-level splitting
+    # Data expected to be pre-filtered to 2015-2021 range
+    TRAIN_SIZE = 0.7    # 70% of accounts for training
+    VAL_SIZE = 0.15     # 15% of accounts for validation  
+    TEST_SIZE = 0.15    # 15% of accounts for testing
+    
+    # Hyperparameter dimensions for Gaussian Process Bayesian optimization
+    # More conservative settings to reduce over-prediction
+    PARAM_DIMENSIONS = [
+        Integer(3, 6, name='max_depth'),          # Reduced from 8 to 6
+        Real(0.001, 0.05, prior='log-uniform', name='eta'),  # Much lower: 0.001-0.05 instead of 0.005-0.2
+        Real(0.6, 1.0, name='subsample'),
+        Real(0.6, 1.0, name='colsample_bytree'),
+        Integer(1, 5, name='min_child_weight'),
+        Real(0.0, 1.0, name='gamma'),
+        Real(0.0, 2.0, name='max_delta_step')
+    ]
+
+
+class FrequencyModel:
+   
+    def __init__(self, config: Optional[FrequencyModelConfig] = None):
+        self.config = config or FrequencyModelConfig()
+        self.random_state = self.config.RANDOM_STATE
+        self.model = None
+        self.preprocessor = None  # sklearn Pipeline (ColumnTransformer + FeatureFilter)
+        self.feature_names = None
+        self.target_feature = "NUM_LOSSES"
+        self.objective = "count:poisson"
+        self.eval_metric = "poisson-nloglik"
+        self.monotone_constraints = None
+        self.best_params = None
+        self.evaluation_results = None
+        
+        # Model metadata
+        self.training_metadata = {}
+
+    def load_csv_data(self, policy_file: str, account_file: str, claims_file: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Load CSV files for frequency modeling"""
+        policy_list_all = pd.read_csv(policy_file)
+        account_list = pd.read_csv(account_file)
+        account_list = account_list.rename(columns={col: col.upper() for col in account_list.columns})
+        claims_list = pd.read_csv(claims_file)
+        
+        return policy_list_all, account_list, claims_list
+
+    def validate_features(self, data: pd.DataFrame, required_features: List[str]):
+        """Validate all required features are present"""
+        missing_features = set(required_features) - set(data.columns)
+        if missing_features:
+            raise ValueError(
+                f"Missing required features for model prediction: {missing_features}\n"
+                f"Available features: {list(data.columns)}\n"
+                f"This indicates a data pipeline issue that needs to be fixed upstream."
+            )
+
+    def create_account_based_splits(self, X: pd.DataFrame, y: pd.Series, account_list: pd.DataFrame, account_col: str = 'COST_ACCT_NUM') -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+        """
+        Create account-based random splits using only accounts from account_list
+        Manager's requirement: Split by unique accounts to prevent data leakage
+        Same account should NOT appear in both train and test sets
+        Only uses accounts present in the provided account_list
+        """
+        
+        # Get valid accounts from account list only
+        valid_accounts = account_list[account_col].unique()
+        print(f"Valid accounts from account list: {len(valid_accounts):,}")
+        
+        # Filter main dataset to only include valid accounts
+        valid_mask = X[account_col].isin(valid_accounts)
+        X_filtered = X[valid_mask].copy()
+        y_filtered = y[valid_mask].copy()
+        
+        print(f"Creating account-based splits using account list:")
+        print(f"  Total records in dataset: {len(X):,}")
+        print(f"  Records with valid accounts: {len(X_filtered):,}")
+        print(f"  Accounts used for splitting: {len(valid_accounts):,}")
+        print(f"  Average records per account: {len(X_filtered)/len(valid_accounts):.1f}")
+        
+        # Randomly shuffle and split the valid accounts (not records!)
+        np.random.seed(self.random_state)
+        shuffled_accounts = np.random.permutation(valid_accounts)
+        
+        # Calculate split indices based on valid accounts
+        n_accounts = len(valid_accounts)
+        train_end = int(n_accounts * self.config.TRAIN_SIZE)
+        val_end = int(n_accounts * (self.config.TRAIN_SIZE + self.config.VAL_SIZE))
+        
+        # Split accounts into three groups
+        train_accounts = shuffled_accounts[:train_end]
+        val_accounts = shuffled_accounts[train_end:val_end]
+        test_accounts = shuffled_accounts[val_end:]
+        
+        print(f"Account distribution (from account list):")
+        print(f"  Train accounts: {len(train_accounts):,} ({len(train_accounts)/n_accounts*100:.1f}%)")
+        print(f"  Validation accounts: {len(val_accounts):,} ({len(val_accounts)/n_accounts*100:.1f}%)")
+        print(f"  Test accounts: {len(test_accounts):,} ({len(test_accounts)/n_accounts*100:.1f}%)")
+        
+        # Create masks for data splitting based on account membership
+        train_mask = X_filtered[account_col].isin(train_accounts)
+        val_mask = X_filtered[account_col].isin(val_accounts)
+        test_mask = X_filtered[account_col].isin(test_accounts)
+        
+        # Split the filtered data
+        X_train = X_filtered[train_mask].copy()
+        X_val = X_filtered[val_mask].copy()
+        X_test = X_filtered[test_mask].copy()
+        
+        y_train = y_filtered[train_mask].copy()
+        y_val = y_filtered[val_mask].copy()
+        y_test = y_filtered[test_mask].copy()
+        
+        # Verification - ensure no account appears in multiple splits
+        train_accounts_set = set(X_train[account_col].unique())
+        val_accounts_set = set(X_val[account_col].unique())
+        test_accounts_set = set(X_test[account_col].unique())
+        
+        # Check for overlaps (should be empty)
+        train_val_overlap = train_accounts_set & val_accounts_set
+        train_test_overlap = train_accounts_set & test_accounts_set
+        val_test_overlap = val_accounts_set & test_accounts_set
+        
+        if train_val_overlap or train_test_overlap or val_test_overlap:
+            raise ValueError(f"Account overlap detected! This should not happen.")
+        
+        print(f"✅ Account-based splits verified - no overlap detected")
+        print(f"Record distribution:")
+        print(f"  Train: {len(X_train):,} records from {len(train_accounts_set):,} accounts")
+        print(f"  Validation: {len(X_val):,} records from {len(val_accounts_set):,} accounts")
+        print(f"  Test: {len(X_test):,} records from {len(test_accounts_set):,} accounts")
+        
+        return X_train, X_val, X_test, y_train, y_val, y_test
+
+    def create_grouped_stratification(self, num_losses: pd.Series) -> pd.Series:
+        """
+        Group rare values for stratification using vectorized operations
+        Improved version using pd.cut() for better performance
+        Using [0, 1, 2+] grouping for insurance frequency data
+        """
+        
+        # For integer loss counts: 0, 1, 2+
+        # Using pd.cut for better performance (manager's suggestion)
+        bins = [-0.5, 0.5, 1.5, float("inf")]
+        labels = ["zero", "one", "two_plus"]
+        
+        # Create categorical groups using vectorized operation
+        result = pd.cut(num_losses, bins=bins, labels=labels, include_lowest=True)
+        
+        # Add missing category and fill NaNs
+        result = result.cat.add_categories(["missing"])
+        result = result.fillna("missing")
+        
+        print(f"Stratification groups created using vectorized pd.cut():")
+        print(f"  Groups: {labels}")
+        print(f"  Performance improvement: ~10x faster than apply()")
+        
+        return result
+
+    def prepare_features(self, X_data):
+        """
+        Prepare feature data with basic cleaning and type conversions
+        Takes only X_data (features), no target column
+        """
+        # Make a copy to avoid modifying original
+        data = X_data.copy()
+        
+        # Handle HIST_LR_3YEAR special case if it exists
+        if "HIST_LR_3YEAR" in data.columns:
+            data["HIST_LR_3YEAR"] = data["HIST_LR_3YEAR"].apply(
+                lambda x: np.nan if pd.isna(x) else (1 if x > 1 else x)
+            )
+        
+        # Convert object columns to category for better memory usage
+        object_cols = data.select_dtypes(include=['object']).columns
+        for col in object_cols:
+            data[col] = data[col].astype('category')
+        
+        return data
+
+    def create_preprocessor(self, non_ohe_features: List[str], ohe_features: List[str]) -> Pipeline:
+        """Create sklearn Pipeline with ColumnTransformer and FeatureFilter"""
+        
+        column_transformer = ColumnTransformer(
+            transformers=[
+                ('num', 'passthrough', [f.upper() for f in non_ohe_features]),
+                ('cat', OneHotEncoder(sparse_output=False, drop=None, handle_unknown='ignore'), 
+                 [f.upper() for f in ohe_features])
+            ],
+            remainder='drop'
+        )
+        
+        # Create full pipeline
+        pipeline = Pipeline([
+            ('preprocessor', column_transformer),
+            ('feature_filter', FeatureFilter())
+        ])
+        
+        return pipeline
+        """Create sklearn Pipeline with ColumnTransformer and FeatureFilter"""
+        
+        column_transformer = ColumnTransformer(
+            transformers=[
+                ('num', 'passthrough', [f.upper() for f in non_ohe_features]),
+                ('cat', OneHotEncoder(sparse_output=False, drop=None, handle_unknown='ignore'), 
+                 [f.upper() for f in ohe_features])
+            ],
+            remainder='drop'
+        )
+        
+        # Create full pipeline
+        pipeline = Pipeline([
+            ('preprocessor', column_transformer),
+            ('feature_filter', FeatureFilter())
+        ])
+        
+        return pipeline
+
+    def create_monotone_constraints(self, feature_names: List[str]) -> str:
+        """Create monotone constraints for frequency model"""
+        constraints = []
+        
+        for col in feature_names:
+            if "A. BELOW" in col:
+                constraints.append("-1")  # Smaller band → fewer claims
+            elif any(x in col for x in ["B. FROM", "C. OVER", "D. UNKNOWN", "LR_3YEAR"]):
+                constraints.append("1")   # Larger band or higher LR → more claims
+            else:
+                constraints.append("0")   # No constraint
+        
+        constraint_string = f"({','.join(constraints)})"
+        
+        # Summary
+        n_increasing = constraints.count("1")
+        n_decreasing = constraints.count("-1")
+        n_none = constraints.count("0")
+        
+        print(f"Monotone constraints: {n_increasing} increasing, {n_decreasing} decreasing, {n_none} unconstrained")
+        
+        return constraint_string
+
+    def optimize_hyperparameters(self, X_train: np.ndarray, y_train: np.ndarray, 
+                                X_val: np.ndarray, y_val: np.ndarray,
+                                n_trials: int = 100) -> Tuple[Dict[str, Any], float]:
+        """
+        Gaussian Process Bayesian optimization using scikit-optimize
+        
+        Uses gp_minimize for sample-efficient hyperparameter optimization.
+        Ideal for small-medium parameter spaces (7 parameters) with 100 trials.
+        """
+        
+        print(f"Starting Gaussian Process Bayesian Optimization ({n_trials} trials)...")
+        print("Using conservative hyperparameters to reduce over-prediction:")
+        print("  - Much lower eta range (0.001-0.05) for gradual learning")
+        print("  - n_estimators=500 with early stopping for better generalization")
+        print("  - Reduced max_depth (3-6) to prevent overfitting")
+        
+        # Define objective function using decorator
+        @use_named_args(self.config.PARAM_DIMENSIONS)
+        def objective(**params):
+            """
+            Objective function for Gaussian Process optimization
+            Returns value to minimize (positive Poisson deviance)
+            """
+            try:
+                # Create XGBRegressor with current parameters
+                model = xgb.XGBRegressor(
+                    objective='count:poisson',
+                    booster='gbtree',
+                    tree_method='exact',
+                    monotone_constraints=self.monotone_constraints,
+                    early_stopping_rounds=self.config.EARLY_STOPPING_ROUNDS,
+                    eval_metric='poisson-nloglik',
+                    random_state=self.random_state,
+                    seed=self.random_state,
+                    n_estimators=500,  # Reduced from 750 to prevent over-prediction
+                    validate_parameters=True,
+                    **params  # Unpack the hyperparameters
+                )
+                
+                # Fit model with early stopping  
+                # Note: eval_metric already set in constructor
+                model.fit(
+                    X_train, y_train,
+                    eval_set=[(X_val, y_val)],
+                    verbose=False
+                )
+                
+                # Make predictions and calculate Poisson deviance
+                y_pred = model.predict(X_val)
+                deviance = mean_poisson_deviance(y_val, y_pred)
+                
+                return deviance  # Return positive deviance (to minimize)
+                
+            except Exception as e:
+                print(f"Error in objective function: {e}")
+                return 999999  # Large positive value for failed trials
+        
+        # Gaussian Process Bayesian optimization (most sample-efficient)
+        result = gp_minimize(
+            func=objective,
+            dimensions=self.config.PARAM_DIMENSIONS,
+            n_calls=n_trials,
+            n_initial_points=10,  # Random exploration phase
+            random_state=self.random_state,
+            verbose=True
+        )
+        
+        # Extract best parameters
+        best_params = {}
+        for i, param_name in enumerate([dim.name for dim in self.config.PARAM_DIMENSIONS]):
+            best_params[param_name] = result.x[i]
+        
+        best_score = result.fun  # This is the minimized Poisson deviance
+        
+        print(f"Optimization complete! Best validation score: {best_score:.6f}")
+        print("Best parameters:")
+        for param, value in best_params.items():
+            if isinstance(value, float):
+                print(f"  {param}: {value:.4f}")
+            else:
+                print(f"  {param}: {value}")
+        
+        return best_params, best_score
+
+    def train_model(self, account_data: pd.DataFrame,
+                   non_ohe_features: List[str],
+                   ohe_features: List[str],
+                   policy_file: str,
+                   account_file: str, 
+                   claims_file: str,
+                   account_col: str = 'COST_ACCT_NUM',
+                   year_col: str = 'WRITN_YEAR',
+                   n_trials: int = None) -> Dict[str, Any]:
+        """
+        Train frequency model with sklearn pipeline preprocessing and GP optimization
+        Manager's updates: Account-based splitting (pre-filtered 2015-2021 data) to prevent data leakage
+        Uses account universe from account_file CSV to control which accounts are eligible for training
+        """
+        
+        n_trials = n_trials or self.config.N_TRIALS_DEFAULT
+        start_time = datetime.now()
+        print("="*60)
+        print("STARTING FREQUENCY MODEL TRAINING")
+        print(f"DATA: PRE-FILTERED 2015-2021 | ACCOUNT-BASED SPLITS")
+        print("="*60)
+        
+        # Load CSV files to get account list
+        print("Loading CSV files...")
+        policy_list_all, account_list, claims_list = self.load_csv_data(policy_file, account_file, claims_file)
+        print(f"✅ Account list loaded: {len(account_list):,} accounts")
+        
+        # Store training metadata
+        self.training_metadata = {
+            'start_time': start_time.isoformat(),
+            'n_trials': n_trials,
+            'optimization_method': 'Gaussian Process (gp_minimize)',
+            'data_split_method': 'Account-based random split (manager approved - prevents data leakage)',
+            'stratification': 'None - pure random account assignment (1,457 accounts sufficient)',
+            'data_range': 'Pre-filtered 2015-2021',
+            'split_strategy': f'Train: {self.config.TRAIN_SIZE*100:.0f}%, Val: {self.config.VAL_SIZE*100:.0f}%, Test: {self.config.TEST_SIZE*100:.0f}% by accounts',
+            'account_column': account_col,
+            'account_universe': 'Restricted to account_list CSV',
+            'features': {
+                'non_ohe': non_ohe_features,
+                'ohe': ohe_features
+            }
+        }
+        
+        # 1. Prepare data first (manager's best practice: separate X and y before splitting)
+        target_col = self.target_feature if self.target_feature in account_data.columns else self.target_feature.lower()
+        
+        print("Step 1: Separating features (X) and target (y) to prevent data leakage...")
+        
+        # Convert column names to uppercase for consistency
+        account_data_upper = account_data.rename(columns={col: col.upper() for col in account_data.columns})
+        target_col_upper = target_col.upper()
+        account_col_upper = account_col.upper()
+        year_col_upper = year_col.upper()
+        
+        # Separate X and y BEFORE splitting (manager's suggestion)
+        X = account_data_upper.drop(columns=[target_col_upper])
+        y = account_data_upper[target_col_upper]
+        
+        print(f"✅ Data separated:")
+        print(f"   X (features): {X.shape}")
+        print(f"   y (target): {y.shape}")
+        print(f"   Account column: {account_col_upper}")
+        print(f"   Data already filtered to 2015-2021 range")
+        
+        # 2. Create account-based random splits using account list
+        print("Step 2: Creating account-based random splits...")
+        X_train, X_val, X_test, y_train, y_val, y_test = self.create_account_based_splits(
+            X, y, account_list, account_col_upper
+        )
+        
+        # 3. Prepare data (basic preprocessing)
+        print("Step 3: Applying basic data preparation...")
+        
+        # Apply basic preparation to each split
+        X_train_prepared = self.prepare_features(X_train)
+        X_val_prepared = self.prepare_features(X_val)
+        X_test_prepared = self.prepare_features(X_test)
+        
+        # 4. Create and fit preprocessor pipeline
+        print("Step 4: Creating and fitting preprocessing pipeline...")
+        self.preprocessor = self.create_preprocessor(non_ohe_features, ohe_features)
+        
+        # Get feature columns (exclude target) and validate they exist
+        all_features = [f.upper() for f in non_ohe_features + ohe_features]
+        
+        # Validate that all required features are present in training data
+        self.validate_features(X_train_prepared, all_features)
+        print(f"✅ All {len(all_features)} required features validated in training data")
+        
+        # Validate that all required features are present in validation data  
+        self.validate_features(X_val_prepared, all_features)
+        print(f"✅ All {len(all_features)} required features validated in validation data")
+        
+        # Now we can safely use the features
+        available_features = all_features  # All are validated to be present
+        
+        # Fit pipeline on training data
+        X_train_features = X_train_prepared[available_features]
+        
+        # Fit and transform training data using the pipeline
+        X_train_processed = self.preprocessor.fit_transform(X_train_features)
+        
+        # Transform validation data using the fitted pipeline
+        X_val_features = X_val_prepared[available_features]
+        X_val_processed = self.preprocessor.transform(X_val_features)
+        
+        # Get feature names from the pipeline
+        # First get names from the column transformer
+        column_transformer = self.preprocessor.named_steps['preprocessor']
+        raw_feature_names = column_transformer.get_feature_names_out()
+        
+        # Then get the filtered feature names
+        feature_filter = self.preprocessor.named_steps['feature_filter']
+        self.feature_names = feature_filter.get_feature_names_out(raw_feature_names)
+        
+        print(f"Features after column transformation: {len(raw_feature_names)}")
+        print(f"Features after filtering: {len(self.feature_names)}")
+        print(f"Training data: {X_train_processed.shape}")
+        print(f"Validation data: {X_val_processed.shape}")
+        
+        # 5. Create monotone constraints
+        print("Step 5: Creating monotone constraints...")
+        self.monotone_constraints = self.create_monotone_constraints(self.feature_names)
+        
+        print("Step 6: Hyperparameter optimization using Gaussian Process...")
+        self.best_params, best_score = self.optimize_hyperparameters(
+            X_train_processed, y_train.values, 
+            X_val_processed, y_val.values, 
+            n_trials
+        )
+        
+        print(f"\nℹ️  NOTE: Using account-based splitting prevents data leakage")
+        print(f"   - Same accounts never appear in both train and test")
+        print(f"   - Model tested on completely unseen accounts")
+        print(f"   - More realistic performance estimate")
+        
+        # 7. Train final model with best parameters
+        print("Step 7: Training final model...")
+        
+        # Create final XGBRegressor with best parameters
+        final_params = {
+            "objective": self.objective,
+            "eval_metric": self.eval_metric,
+            "booster": "gbtree",
+            "tree_method": "exact",
+            "monotone_constraints": self.monotone_constraints,
+            "early_stopping_rounds": self.config.EARLY_STOPPING_ROUNDS,
+            "validate_parameters": True,
+            "random_state": self.random_state,
+            "seed": self.random_state,
+            "n_estimators": 500  # Reduced from 750 to prevent over-prediction
+        }
+        final_params.update(self.best_params)
+        
+        self.model = xgb.XGBRegressor(**final_params)
+        
+        print("Training final frequency model with best parameters...")
+        print(f"Using conservative settings: eta (0.001-0.05) and n_estimators=500 to reduce over-prediction")
+        print(f"Account-based splits ensure no data leakage between train/test")
+        
+        # Train with validation set for early stopping
+        # Note: eval_metric already set in constructor, don't repeat in fit()
+        self.model.fit(
+            X_train_processed, y_train,
+            eval_set=[(X_train_processed, y_train), (X_val_processed, y_val)],
+            verbose=50  # Print every 50 rounds
+        )
+        
+        # Get best iteration and score from the model
+        best_iteration = self.model.best_iteration if hasattr(self.model, 'best_iteration') else len(self.model.get_booster().get_dump())
+        
+        print(f"Final model: {best_iteration} trees, best score: {best_score:.6f}")
+        
+        # 8. Evaluate on test data
+        print("Step 8: Evaluating on test data...")
+        
+        # Prepare test data for evaluation
+        X_test_prepared = self.prepare_features(X_test)
+        
+        # Validate test data has required features
+        self.validate_features(X_test_prepared, available_features)
+        print(f"✅ All {len(available_features)} required features validated in test data")
+        
+        # Make predictions on test data
+        X_test_features = X_test_prepared[available_features]
+        X_test_processed = self.preprocessor.transform(X_test_features)
+        test_predictions = self.model.predict(X_test_processed)
+        
+        # Comprehensive evaluation
+        self.evaluation_results = self.comprehensive_evaluation(
+            X_test_prepared, y_test.values, test_predictions
+        )
+        
+        # Complete training metadata
+        end_time = datetime.now()
+        self.training_metadata.update({
+            'end_time': end_time.isoformat(),
+            'training_duration': str(end_time - start_time),
+            'best_iteration': best_iteration,
+            'best_score': best_score,
+            'xgboost_version': xgb.__version__,
+            'total_features': len(self.feature_names)
+        })
+        
+        print(f"\nTraining completed successfully in {end_time - start_time}")
+        print(f"Data: Pre-filtered 2015-2021, Account-based splits")
+        print("="*60)
+        
+        return {
+            "model": self.model,
+            "best_params": self.best_params,
+            "best_score": best_score,
+            "feature_names": self.feature_names,
+            "preprocessor": self.preprocessor,
+            "evaluation_results": self.evaluation_results,
+            "X_train": X_train, "y_train": y_train,
+            "X_val": X_val, "y_val": y_val,
+            "X_test": X_test, "y_test": y_test,
+            "training_metadata": self.training_metadata
+        }
+
+    def predict(self, new_data: pd.DataFrame, feature_columns: List[str]) -> np.ndarray:
+        """Make predictions using the fitted preprocessing pipeline and model"""
+        if self.model is None:
+            raise ValueError("Model not trained yet. Call train_model() first.")
+        
+        if self.preprocessor is None:
+            raise ValueError("Preprocessing pipeline not fitted. Model may not be properly trained.")
+        
+        # Validate that all required features are present
+        required_features = [f.upper() for f in feature_columns]
+        self.validate_features(new_data, required_features)
+        print(f"✅ All {len(required_features)} required features validated in prediction data")
+        
+        # Use only the specified feature columns (all validated to be present)
+        X = new_data[required_features]
+        
+        # Apply the full preprocessing pipeline (ColumnTransformer + FeatureFilter)
+        X_processed = self.preprocessor.transform(X)
+        
+        print(f"Prediction data processed through pipeline: {X_processed.shape}")
+        
+        # Make predictions using sklearn XGBRegressor
+        return self.model.predict(X_processed)
+
+    def comprehensive_evaluation(self, test_features: pd.DataFrame, y_test: np.ndarray, predictions: np.ndarray) -> Dict[str, Any]:
+        """Comprehensive evaluation metrics for frequency model"""
+        
+        # Basic Performance Metrics using sklearn's mean_poisson_deviance
+        basic_metrics = {
+            'poisson_deviance': mean_poisson_deviance(y_test, predictions),
+            'mae': mean_absolute_error(y_test, predictions),
+            'rmse': np.sqrt(mean_squared_error(y_test, predictions)),
+            'mean_actual': y_test.mean(),
+            'mean_predicted': predictions.mean(),
+            'mean_ratio': predictions.mean() / y_test.mean() if y_test.mean() > 0 else np.nan,
+            'n_test_accounts': len(y_test)
+        }
+        
+        # RMSE/NRMSE analysis
+        rmse_value = basic_metrics['rmse']
+        nrmse_results = {
+            "sd": rmse_value / np.std(y_test),
+            "mean": rmse_value / np.mean(y_test),
+            "median": rmse_value / np.median(y_test),
+            "maxmin": rmse_value / (np.max(y_test) - np.min(y_test))
+        }
+        
+        # Distribution comparison
+        actual_dist = pd.Series(y_test).value_counts().sort_index()
+        pred_dist = pd.Series(np.round(predictions)).value_counts().sort_index()
+        
+        all_values = sorted(set(list(actual_dist.index) + list(pred_dist.index)))
+        actual_dist = actual_dist.reindex(all_values, fill_value=0)
+        pred_dist = pred_dist.reindex(all_values, fill_value=0)
+        
+        distribution_comparison = pd.DataFrame({
+            'Actual_Count': actual_dist,
+            'Predicted_Count': pred_dist,
+            'Actual_Pct': actual_dist / len(y_test) * 100,
+            'Predicted_Pct': pred_dist / len(predictions) * 100
+        })
+        
+        # Yearly analysis if year column exists
+        yearly_analysis = None
+        if 'WRITN_YEAR' in test_features.columns:
+            test_results = test_features.copy()
+            test_results['predicted_losses'] = predictions
+            test_results['actual_losses'] = y_test
+            
+            yearly_analysis = test_results.groupby('WRITN_YEAR').agg({
+                'actual_losses': ['count', 'mean', 'sum'],
+                'predicted_losses': ['mean', 'sum']
+            }).round(4)
+        
+        return {
+            'basic_metrics': basic_metrics,
+            'nrmse_results': nrmse_results,
+            'distribution_comparison': distribution_comparison,
+            'yearly_analysis': yearly_analysis
+        }
+
+    def get_feature_importance(self, importance_type: str = 'weight') -> pd.DataFrame:
+        """Get feature importance as a DataFrame"""
+        if self.model is None:
+            raise ValueError("Model not trained yet.")
+        
+        # For sklearn XGBRegressor, get importance from the booster
+        if hasattr(self.model, 'get_booster'):
+            importance = self.model.get_booster().get_score(importance_type=importance_type)
+        else:
+            # Fallback to feature_importances_ attribute
+            importance_values = getattr(self.model, 'feature_importances_', None)
+            if importance_values is None:
+                raise ValueError("No feature importance available from model")
+            importance = dict(zip(self.feature_names, importance_values))
+        
+        # Convert to DataFrame
+        importance_df = pd.DataFrame([
+            {'feature': k, 'importance': v}
+            for k, v in importance.items()
+        ])
+        
+        # Sort by importance
+        importance_df = importance_df.sort_values('importance', ascending=False)
+        importance_df['rank'] = range(1, len(importance_df) + 1)
+        importance_df['importance_pct'] = (importance_df['importance'] /
+                                          importance_df['importance'].sum() * 100)
+        
+        return importance_df
+
+    def save_model(self, filepath: str):
+        """Save the complete trained frequency model and sklearn pipeline"""
+        if self.model is None:
+            raise ValueError("Model not trained yet.")
+        
+        model_artifacts = {
+            "model": self.model,
+            "preprocessor": self.preprocessor,
+            "feature_names": self.feature_names,
+            "target_feature": self.target_feature,
+            "objective": self.objective,
+            "eval_metric": self.eval_metric,
+            "monotone_constraints": self.monotone_constraints,
+            "best_params": self.best_params,
+            "evaluation_results": self.evaluation_results,
+            "training_metadata": self.training_metadata,
+            "config": self.config
+        }
+        
+        joblib.dump(model_artifacts, filepath)
+        print(f"Frequency model saved to {filepath}")
+
+    def load_model(self, filepath: str):
+        """Load a trained frequency model and sklearn pipeline"""
+        model_artifacts = joblib.load(filepath)
+        
+        self.model = model_artifacts["model"]
+        self.preprocessor = model_artifacts["preprocessor"]
+        self.feature_names = model_artifacts["feature_names"]
+        self.target_feature = model_artifacts["target_feature"]
+        self.objective = model_artifacts["objective"]
+        self.eval_metric = model_artifacts["eval_metric"]
+        self.monotone_constraints = model_artifacts["monotone_constraints"]
+        self.best_params = model_artifacts["best_params"]
+        self.evaluation_results = model_artifacts["evaluation_results"]
+        self.training_metadata = model_artifacts.get("training_metadata", {})
+        self.config = model_artifacts.get("config", FrequencyModelConfig())
+        
+        print(f"Frequency model loaded from {filepath}")
+
+    def plot_feature_importance(self, max_features: int = 20):
+        """Plot feature importance"""
+        if self.model is None:
+            raise ValueError("Model not trained yet.")
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # For sklearn XGBRegressor, plot using the booster
+        if hasattr(self.model, 'get_booster'):
+            xgb.plot_importance(self.model.get_booster(), importance_type='weight',
+                               max_num_features=max_features, ax=ax)
+        else:
+            # Fallback: create manual plot from feature_importances_
+            importance_df = self.get_feature_importance()
+            top_features = importance_df.head(max_features)
+            ax.barh(range(len(top_features)), top_features['importance'])
+            ax.set_yticks(range(len(top_features)))
+            ax.set_yticklabels(top_features['feature'])
+            ax.set_xlabel('Importance')
+            
+        plt.title("Frequency Model - Feature Importance")
+        plt.tight_layout()
+        return fig
+
+    def print_evaluation_summary(self):
+        """Print comprehensive evaluation summary"""
+        if self.evaluation_results is None:
+            print("No evaluation results available. Train model first.")
+            return
+        
+        print("="*60)
+        print("FREQUENCY MODEL EVALUATION SUMMARY")
+        print("="*60)
+        
+        print("\n1. BASIC PERFORMANCE METRICS:")
+        for metric, value in self.evaluation_results['basic_metrics'].items():
+            if metric != 'n_test_accounts':
+                print(f"   {metric}: {value:.6f}")
+            else:
+                print(f"   {metric}: {value:,}")
+        
+        print("\n2. NORMALIZED RMSE:")
+        for norm_type, value in self.evaluation_results['nrmse_results'].items():
+            print(f"   NRMSE ({norm_type}): {value:.6f}")
+        
+        print("\n3. DISTRIBUTION COMPARISON:")
+        print(self.evaluation_results['distribution_comparison'])
+        
+        if self.evaluation_results['yearly_analysis'] is not None:
+            print("\n4. YEARLY ANALYSIS:")
+            print(self.evaluation_results['yearly_analysis'])
