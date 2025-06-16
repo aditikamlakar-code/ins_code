@@ -1,0 +1,316 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_poisson_deviance
+import joblib
+
+def load_trained_model(model_path):
+    """Load the trained frequency model"""
+    try:
+        # If using FrequencyModel class
+        from your_frequency_module import FrequencyModel  # Update import path
+        
+        freq_model = FrequencyModel()
+        freq_model.load_model(model_path)
+        print(f"✅ Model loaded from: {model_path}")
+        return freq_model
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return None
+
+def load_test_data(test_data_path):
+    """Load test data (2022-2024)"""
+    try:
+        test_data = pd.read_csv(test_data_path)
+        print(f"✅ Test data loaded: {test_data.shape}")
+        
+        # Filter to 2022-2024 if needed
+        if 'WRITN_YEAR' in test_data.columns:
+            test_data = test_data[test_data['WRITN_YEAR'].isin([2022, 2023, 2024])]
+            print(f"✅ Filtered to 2022-2024: {test_data.shape}")
+        
+        return test_data
+    except Exception as e:
+        print(f"❌ Error loading test data: {e}")
+        return None
+
+def evaluate_frequency_model_on_test_set(model_path, test_data_path, feature_columns, target_column='NUM_LOSSES'):
+    """
+    Evaluate frequency model on test set - EXACT R STYLE
+    Matches R EVALUATE_MODEL_ON_TEST_SET function
+    """
+    
+    print("="*60)
+    print("FREQUENCY MODEL TEST SET EVALUATION")
+    print("="*60)
+    
+    # 1. Load model and test data
+    print("Step 1: Loading trained model...")
+    freq_model = load_trained_model(model_path)
+    if freq_model is None:
+        return None
+    
+    print("Step 2: Loading test data...")
+    test_data = load_test_data(test_data_path)
+    if test_data is None:
+        return None
+    
+    # 3. Generate predictions (matching R GENERATE_PREDICTIONS_FROM_MODEL)
+    print("Step 3: Generating predictions on test data...")
+    try:
+        predictions = freq_model.predict(test_data, feature_columns)
+        print(f"✅ Predictions generated: {len(predictions)} records")
+    except Exception as e:
+        print(f"❌ Error generating predictions: {e}")
+        return None
+    
+    # 4. Get actual values (matching R)
+    if target_column not in test_data.columns:
+        target_column = target_column.lower()
+    
+    actual = test_data[target_column].values
+    
+    # 5. Remove NA values (matching R)
+    valid_indices = ~(np.isnan(predictions) | np.isnan(actual))
+    pred_clean = predictions[valid_indices]
+    actual_clean = actual[valid_indices]
+    
+    if len(pred_clean) == 0:
+        print("❌ No valid prediction-actual pairs after removing NAs")
+        return None
+    
+    print(f"✅ Valid predictions: {len(pred_clean):,}")
+    
+    # 6. Calculate evaluation metrics (EXACT R style)
+    evaluation_results = {
+        'model_type': 'frequency',
+        
+        # Basic metrics (matching R RMSE, MAE functions)
+        'rmse': np.sqrt(np.mean((pred_clean - actual_clean)**2)),
+        'mae': np.mean(np.abs(pred_clean - actual_clean)),
+        'mape': np.mean(np.abs((actual_clean - pred_clean) / np.maximum(actual_clean, 1e-10)) * 100),
+        
+        # Normalized RMSE (matching R NRMSE function exactly)
+        'nrmse_sd': np.sqrt(np.mean((pred_clean - actual_clean)**2)) / np.std(actual_clean),
+        'nrmse_mean': np.sqrt(np.mean((pred_clean - actual_clean)**2)) / np.mean(actual_clean),
+        'nrmse_median': np.sqrt(np.mean((pred_clean - actual_clean)**2)) / np.median(actual_clean),
+        'nrmse_range': np.sqrt(np.mean((pred_clean - actual_clean)**2)) / (np.max(actual_clean) - np.min(actual_clean)),
+        
+        # Model performance indicators (matching R)
+        'mean_actual': np.mean(actual_clean),
+        'mean_predicted': np.mean(pred_clean),
+        'mean_ratio': np.mean(pred_clean) / np.mean(actual_clean),
+        'bias': np.mean(pred_clean - actual_clean),
+        
+        # Correlation (matching R cor function)
+        'correlation': np.corrcoef(pred_clean, actual_clean)[0, 1],
+        
+        # Sample size
+        'n_observations': len(pred_clean),
+        
+        # Store for plotting (matching R)
+        'predictions': pred_clean,
+        'actual': actual_clean
+    }
+    
+    # 7. Print results (EXACT R style formatting)
+    print("\n" + "="*40)
+    print("FREQUENCY MODEL TEST SET EVALUATION")
+    print("="*40)
+    print(f"RMSE:              {evaluation_results['rmse']:.6f}")
+    print(f"MAE:               {evaluation_results['mae']:.6f}")
+    print(f"MAPE:              {evaluation_results['mape']:.2f}%")
+    print(f"Correlation:       {evaluation_results['correlation']:.6f}")
+    print(f"Bias:              {evaluation_results['bias']:.6f}")
+    print(f"Mean Actual:       {evaluation_results['mean_actual']:.6f}")
+    print(f"Mean Predicted:    {evaluation_results['mean_predicted']:.6f}")
+    print(f"Mean Ratio:        {evaluation_results['mean_ratio']:.6f}")
+    print(f"NRMSE (SD):        {evaluation_results['nrmse_sd']:.6f}")
+    print(f"NRMSE (Mean):      {evaluation_results['nrmse_mean']:.6f}")
+    print(f"NRMSE (Median):    {evaluation_results['nrmse_median']:.6f}")
+    print(f"NRMSE (Range):     {evaluation_results['nrmse_range']:.6f}")
+    print(f"N Observations:    {evaluation_results['n_observations']:,}")
+    
+    return evaluation_results
+
+def prediction_xy_graph(evaluation_results, title_suffix=""):
+    """
+    EXACT R PREDICTION_XY_GRAPH function
+    Creates scatter plot with log scale and perfect prediction line
+    """
+    
+    predictions = evaluation_results['predictions']
+    actual = evaluation_results['actual']
+    
+    # Calculate graph scale (matching R)
+    graph_scale = 1.1 * (1 + max(np.max(predictions), np.max(actual)))
+    
+    plt.figure(figsize=(8, 8))
+    
+    # Scatter plot (matching R geom_point)
+    plt.scatter(1 + actual, 1 + predictions, s=30, alpha=0.6, color='blue')
+    
+    # Perfect prediction line (matching R geom_abline)
+    plt.plot([1, graph_scale], [1, graph_scale], 'r-', linewidth=2, label='Perfect Prediction')
+    
+    # Log scale (matching R scale_x_continuous(trans="log10"))
+    plt.xscale('log')
+    plt.yscale('log')
+    
+    # Set limits (matching R)
+    plt.xlim(1, graph_scale)
+    plt.ylim(1, graph_scale)
+    
+    # Labels and title (matching R)
+    plt.xlabel('1 + Actual')
+    plt.ylabel('1 + Predicted')
+    plt.title(f'Frequency Model - Test Set Evaluation{title_suffix}')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    # Add correlation text
+    corr = evaluation_results['correlation']
+    plt.text(0.05, 0.95, f'Correlation: {corr:.3f}', transform=plt.gca().transAxes, 
+             fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    plt.tight_layout()
+    return plt.gcf()
+
+def prediction_density_graph(evaluation_results, title_suffix=""):
+    """
+    EXACT R PREDICTION_DENSITY_GRAPH function
+    Creates density comparison of log10(1+value)
+    """
+    
+    predictions = evaluation_results['predictions']
+    actual = evaluation_results['actual']
+    
+    plt.figure(figsize=(10, 6))
+    
+    # Density plots (matching R geom_density)
+    plt.hist(np.log10(1 + actual), bins=50, alpha=0.6, density=True, 
+             color='blue', label='Actual', edgecolor='black', linewidth=0.5)
+    plt.hist(np.log10(1 + predictions), bins=50, alpha=0.6, density=True, 
+             color='red', label='Predicted', edgecolor='black', linewidth=0.5)
+    
+    # Labels and title (matching R)
+    plt.xlabel('Log10(1 + Value)')
+    plt.ylabel('Density')
+    plt.title(f'Frequency Model - Distribution Comparison{title_suffix}')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    return plt.gcf()
+
+def save_test_evaluation_graphs(evaluation_results, folder="TEST_EVALUATION", filename_prefix="FREQ_TEST"):
+    """
+    Save evaluation graphs (matching R SAVE_TEST_EVALUATION_GRAPHS)
+    """
+    
+    import os
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    
+    # XY Plot (matching R)
+    xy_fig = prediction_xy_graph(evaluation_results)
+    xy_filename = f"{folder}/{filename_prefix}_XY.png"
+    xy_fig.savefig(xy_filename, dpi=300, bbox_inches='tight')
+    plt.close(xy_fig)
+    
+    # Density Plot (matching R)
+    density_fig = prediction_density_graph(evaluation_results)
+    density_filename = f"{folder}/{filename_prefix}_Density.png"
+    density_fig.savefig(density_filename, dpi=300, bbox_inches='tight')
+    plt.close(density_fig)
+    
+    print(f"✅ Saved evaluation graphs to {folder}/:")
+    print(f"   - {filename_prefix}_XY.png")
+    print(f"   - {filename_prefix}_Density.png")
+    
+    return xy_filename, density_filename
+
+def comprehensive_test_evaluation():
+    """
+    Complete test evaluation with all R-style plots and metrics
+    UPDATE THESE PATHS:
+    """
+    
+    # UPDATE THESE PATHS:
+    model_path = "frequency_model_20241216.joblib"  # Your saved model
+    test_data_path = "test_data_2022_2024.csv"      # Your test data
+    
+    # UPDATE THESE FEATURES (same as training):
+    feature_columns = [
+        "DIRECT_OR_RT", "HIST_LR_3YEAR", "DEVELOPMENT", "FIN_RISK_SCR",
+        "LOG_NUM_SITES", "LOG_TURNOVER", "LOG_EMPLOYEES", "LOG_GMP",
+        "TENURE", "GCS_SEGMENT", "BROKER_BAND", "LOB_SUB_GROUP_2", "LOB_SUB_GROUP_3"
+    ]
+    
+    print("Starting comprehensive frequency model test evaluation...")
+    print("Matching R script evaluation style exactly")
+    
+    # 1. Run evaluation
+    results = evaluate_frequency_model_on_test_set(
+        model_path=model_path,
+        test_data_path=test_data_path,
+        feature_columns=feature_columns,
+        target_column='NUM_LOSSES'
+    )
+    
+    if results is None:
+        print("❌ Evaluation failed")
+        return None
+    
+    # 2. Create and save all plots (matching R)
+    print("\nCreating evaluation plots...")
+    
+    # Individual plots (matching R functions)
+    xy_fig = prediction_xy_graph(results)
+    plt.show()
+    
+    density_fig = prediction_density_graph(results)
+    plt.show()
+    
+    # 3. Save plots
+    save_test_evaluation_graphs(results, "EVALUATION_2022_2024", "FREQ_MODEL")
+    
+    # 4. Summary
+    print(f"\n🎉 Frequency model test evaluation completed!")
+    print(f"📈 Trained on: 2015-2021 | Tested on: 2022-2024")
+    print(f"📊 Key Metrics:")
+    print(f"   RMSE: {results['rmse']:.6f}")
+    print(f"   MAE: {results['mae']:.6f}")
+    print(f"   Correlation: {results['correlation']:.6f}")
+    print(f"   Mean Ratio: {results['mean_ratio']:.6f}")
+    print(f"   NRMSE (SD): {results['nrmse_sd']:.6f}")
+    print(f"   Sample Size: {results['n_observations']:,}")
+    
+    return results
+
+# For Google Colab/Jupyter download
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+# Main execution
+if __name__ == "__main__":
+    
+    print("="*60)
+    print("FREQUENCY MODEL TEST SET EVALUATION")
+    print("EXACT R SCRIPT ALIGNMENT")
+    print("="*60)
+    
+    # Run complete evaluation
+    evaluation_results = comprehensive_test_evaluation()
+    
+    if evaluation_results and IN_COLAB:
+        print("\n📥 Downloading evaluation plots...")
+        try:
+            files.download('EVALUATION_2022_2024/FREQ_MODEL_XY.png')
+            files.download('EVALUATION_2022_2024/FREQ_MODEL_Density.png')
+        except:
+            print("Note: Download may not work in all environments")
