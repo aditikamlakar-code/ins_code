@@ -1,0 +1,520 @@
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import xgboost as xgb
+from typing import List, Dict, Tuple, Any, Optional
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import joblib
+import warnings
+from datetime import datetime
+from skopt import gp_minimize
+from skopt.space import Real, Integer
+from skopt.utils import use_named_args
+
+
+class FeatureFilter(BaseEstimator, TransformerMixin):
+    def __init__(self, min_sample_ratio=0.01, min_samples=100):  # ✅ Changed from 50 to 100 like R
+        self.min_sample_ratio = min_sample_ratio
+        self.min_samples = min_samples
+        self.features_to_keep_ = None
+
+    def fit(self, X, y=None):
+        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        min_required = max(self.min_samples, len(X_df) * self.min_sample_ratio)
+        self.features_to_keep_ = X_df.apply(lambda x: x.gt(0).sum() >= min_required, axis=0)
+        return self
+
+    def transform(self, X):
+        if self.features_to_keep_ is None:
+            raise ValueError("FeatureFilter not fitted yet")
+        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+        return X_df.loc[:, self.features_to_keep_].values
+
+    def get_feature_names_out(self, input_features=None):
+        if self.features_to_keep_ is None:
+            raise ValueError("FeatureFilter not fitted yet")
+        if input_features is None:
+            return [f"feature_{i}" for i in range(self.features_to_keep_.sum())]
+        else:
+            return [name for name, keep in zip(input_features, self.features_to_keep_) if keep]
+
+
+class ConservativeSeverityModelConfig:
+    EARLY_STOPPING_ROUNDS = 50
+    N_TRIALS_DEFAULT = 50  # ✅ Reduced from 100 to be more conservative
+    RANDOM_STATE = 12
+    TRAIN_SIZE = 0.7
+    
+    # ✅ CONSERVATIVE PARAMETER RANGES - Centered around R's proven values
+    PARAM_DIMENSIONS = [
+        Integer(2, 3, name='max_depth'),           # ✅ R uses 2, allow 2-3 only
+        Real(0.05, 0.15, name='eta'),             # ✅ R uses 0.1, narrow range around it
+        Real(0.8, 1.0, name='subsample'),         # ✅ R uses 0.9, keep high
+        Real(0.8, 1.0, name='colsample_bytree'),  # ✅ R uses 1.0, keep high
+        Integer(1, 2, name='min_child_weight'),   # ✅ R uses 1, allow 1-2 only
+        Real(0.0, 0.1, name='gamma'),             # ✅ R uses 0.05, light regularization only
+        Real(0.0, 0.3, name='reg_lambda')         # ✅ Conservative regularization
+    ]
+
+
+class ConservativeSeverityModel:
+    def __init__(self, config: Optional[ConservativeSeverityModelConfig] = None):
+        self.config = config or ConservativeSeverityModelConfig()
+        self.random_state = self.config.RANDOM_STATE
+        self.model = None
+        self.preprocessor = None
+        self.feature_names = None
+        self.target_feature = "LOG_INCURRED"
+        self.objective = "reg:squarederror"  # ✅ Correct for log data
+        self.eval_metric = "rmse"
+        self.monotone_constraints = None
+        self.best_params = None
+        self.evaluation_results = None
+        self.training_metadata = {}
+
+    def load_csv_data(self, claims_file: str, account_file: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        claims_list = pd.read_csv(claims_file)
+        account_list = pd.read_csv(account_file)
+        account_list = account_list.rename(columns={col: col.upper() for col in account_list.columns})
+        return claims_list, account_list
+
+    def generate_claim_account_list(self, claims_list: pd.DataFrame, account_list: pd.DataFrame) -> pd.DataFrame:
+        claims_columns = ['INSD_NM', 'CLM_CUST_POL_REF', 'CL_LOB_5', 'CLM_REF',
+                          'WRITN_YEAR', 'INCURRED', 'LEVELLED_INCURRED', 'CAT_FLAG']
+        claims_account_list = pd.merge(
+            claims_list[claims_columns],
+            account_list,
+            on=['INSD_NM', 'CL_LOB_5', 'WRITN_YEAR'],
+            how='left'
+        )
+        claims_account_list = claims_account_list[claims_account_list['INSD_NM'] != ""]
+        claims_account_list = claims_account_list[claims_account_list['INCURRED'] > 10]
+        # Keep original LOG_INCURRED as extra
+        claims_account_list['LOG_INCURRED_ORIG'] = np.log10(1 + claims_account_list['LEVELLED_INCURRED'])
+        # Use LOG_INCURRED for modeling (can be the same as LOG_INCURRED_ORIG)
+        claims_account_list['LOG_INCURRED'] = claims_account_list['LOG_INCURRED_ORIG']
+        return claims_account_list
+
+    def create_random_splits(self, X: pd.DataFrame, y: pd.Series):
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y,
+            test_size=(1 - self.config.TRAIN_SIZE),
+            random_state=self.random_state,
+            stratify=None
+        )
+        print(f"Random splits created (no stratification):")
+        print(f"  Train (random): {len(X_train):,} claims")
+        print(f"  Validation (random): {len(X_val):,} claims")
+        return X_train, X_val, y_train, y_val
+
+    def prepare_features(self, X_data: pd.DataFrame) -> pd.DataFrame:
+        data = X_data.copy()
+        if "HIST_LR_3YEAR" in data.columns:
+            data["HIST_LR_3YEAR"] = data["HIST_LR_3YEAR"].apply(
+                lambda x: np.nan if pd.isna(x) else 1 if x > 1 else x
+            )
+        for col in data.select_dtypes(include=['object']).columns:
+            data[col] = data[col].astype('category')
+        return data
+
+    def create_preprocessor(self, non_ohe_features: List[str], ohe_features: List[str]) -> Pipeline:
+        column_transformer = ColumnTransformer(
+            transformers=[
+                ('num', 'passthrough', [f.upper() for f in non_ohe_features]),
+                ('cat', OneHotEncoder(sparse_output=False, drop=None, handle_unknown='ignore'),
+                 [f.upper() for f in ohe_features])
+            ],
+            remainder='drop'
+        )
+        pipeline = Pipeline([
+            ('preprocessor', column_transformer),
+            ('feature_filter', FeatureFilter())  # ✅ Now uses stricter 100+ samples
+        ])
+        return pipeline
+
+    def create_monotone_constraints(self, feature_names: List[str]) -> str:
+        constraints = []
+        for col in feature_names:
+            if "A. Below" in col:
+                constraints.append("-1")
+            elif any(x in col for x in ["B. From ", "C. Over", "D. Unknown", "LR_3YEAR"]):
+                constraints.append("1")
+            else:
+                constraints.append("0")
+        constraint_string = f"({','.join(constraints)})"
+        n_increasing = constraints.count("1")
+        n_decreasing = constraints.count("-1")
+        n_none = constraints.count("0")
+        print(f"Monotone constraints: {n_increasing} increasing, {n_decreasing} decreasing, {n_none} unconstrained")
+        return constraint_string
+
+    def optimize_hyperparameters(self, X_train: np.ndarray, y_train: np.ndarray,
+                                 X_val: np.ndarray, y_val: np.ndarray,
+                                 n_trials: int = 50) -> Tuple[Dict[str, Any], float]:
+        
+        @use_named_args(self.config.PARAM_DIMENSIONS)
+        def objective(**params):
+            try:
+                # ✅ Add R's stabilization parameters
+                model_params = {
+                    "objective": self.objective,
+                    "booster": 'gbtree',
+                    "tree_method": 'exact',
+                    "monotone_constraints": self.monotone_constraints,
+                    "early_stopping_rounds": self.config.EARLY_STOPPING_ROUNDS,
+                    "eval_metric": self.eval_metric,
+                    "random_state": self.random_state,
+                    "seed": self.random_state,
+                    "n_estimators": 1000,  # ✅ More like R's 10000 rounds
+                    "validate_parameters": True,
+                    "max_delta_step": 0.8,  # ✅ Add R's critical stabilization parameter
+                    **params
+                }
+                
+                model = xgb.XGBRegressor(**model_params)
+                model.fit(
+                    X_train, y_train,
+                    eval_set=[(X_train, y_train), (X_val, y_val)],
+                    verbose=False
+                )
+                y_pred = model.predict(X_val)
+                rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+                return rmse
+            except Exception as e:
+                print(f"Error in objective function: {e}")
+                return 999999
+
+        result = gp_minimize(
+            func=objective,
+            dimensions=self.config.PARAM_DIMENSIONS,
+            n_calls=n_trials,
+            n_initial_points=10,
+            random_state=self.random_state,
+            verbose=True
+        )
+        
+        best_params = {}
+        for i, param_name in enumerate([dim.name for dim in self.config.PARAM_DIMENSIONS]):
+            best_params[param_name] = result.x[i]
+        
+        best_score = result.fun
+        print(f"Conservative optimization complete! Best validation score: {best_score:.6f}")
+        print("Best parameters found:")
+        for param, value in best_params.items():
+            if isinstance(value, float):
+                print(f"  {param}: {value:.4f}")
+            else:
+                print(f"  {param}: {value}")
+        return best_params, best_score
+
+    def train_model(self, claims_list: pd.DataFrame,
+                   account_list: pd.DataFrame,
+                   non_ohe_features: List[str],
+                   ohe_features: List[str],
+                   n_trials: int = None) -> Dict[str, Any]:
+        
+        n_trials = n_trials or self.config.N_TRIALS_DEFAULT
+        start_time = datetime.now()
+        print("="*60)
+        print("STARTING CONSERVATIVE SEVERITY MODEL TRAINING")
+        print("="*60)
+        
+        self.training_metadata = {
+            'start_time': start_time.isoformat(),
+            'n_trials': n_trials,
+            'optimization_type': 'conservative_bayesian',
+            'features': {
+                'non_ohe': non_ohe_features,
+                'ohe': ohe_features
+            }
+        }
+        
+        print("Step 1: Generating claims-account dataset...")
+        claims_account_data = self.generate_claim_account_list(claims_list, account_list)
+        target_col = self.target_feature
+        claims_account_data = claims_account_data.rename(columns={col: col.upper() for col in claims_account_data.columns})
+        target_col_upper = target_col.upper()
+        X = claims_account_data.drop(columns=[target_col_upper])
+        y = claims_account_data[target_col_upper]
+        
+        print("Step 2: Creating random splits...")
+        X_train, X_val, y_train, y_val = self.create_random_splits(X, y)
+        
+        print("Step 3: Applying basic data preparation...")
+        X_train_prepared = self.prepare_features(X_train)
+        X_val_prepared = self.prepare_features(X_val)
+        
+        print("Step 4: Creating and fitting preprocessing pipeline...")
+        self.preprocessor = self.create_preprocessor(non_ohe_features, ohe_features)
+        all_features = [f.upper() for f in non_ohe_features + ohe_features]
+        X_train_features = X_train_prepared[all_features]
+        X_train_processed = self.preprocessor.fit_transform(X_train_features)
+        X_val_features = X_val_prepared[all_features]
+        X_val_processed = self.preprocessor.transform(X_val_features)
+        
+        column_transformer = self.preprocessor.named_steps['preprocessor']
+        raw_feature_names = column_transformer.get_feature_names_out()
+        feature_filter = self.preprocessor.named_steps['feature_filter']
+        self.feature_names = feature_filter.get_feature_names_out(raw_feature_names)
+        
+        print(f"Features after column transformation: {len(raw_feature_names)}")
+        print(f"Features after stricter filtering (100+ samples): {len(self.feature_names)}")
+        
+        print("Step 5: Creating monotone constraints...")
+        self.monotone_constraints = self.create_monotone_constraints(self.feature_names)
+        
+        print("Step 6: CONSERVATIVE Bayesian optimization...")
+        print("Using conservative parameter ranges around R's proven values:")
+        for dim in self.config.PARAM_DIMENSIONS:
+            print(f"  {dim.name}: {dim}")
+        
+        self.best_params, best_score = self.optimize_hyperparameters(
+            X_train_processed, y_train.values,
+            X_val_processed, y_val.values,
+            n_trials
+        )
+        
+        print("Step 7: Training final model with conservative parameters...")
+        final_params = {
+            "objective": self.objective,
+            "eval_metric": self.eval_metric,
+            "booster": "gbtree",
+            "tree_method": "exact",
+            "monotone_constraints": self.monotone_constraints,
+            "early_stopping_rounds": self.config.EARLY_STOPPING_ROUNDS,
+            "validate_parameters": True,
+            "random_state": self.random_state,
+            "seed": self.random_state,
+            "n_estimators": 1000,  # ✅ More rounds like R
+            "max_delta_step": 0.8   # ✅ R's stabilization parameter
+        }
+        final_params.update(self.best_params)
+        
+        self.model = xgb.XGBRegressor(**final_params)
+        self.model.fit(
+            X_train_processed, y_train,
+            eval_set=[(X_train_processed, y_train), (X_val_processed, y_val)],
+            verbose=50
+        )
+        
+        best_iteration = self.model.best_iteration if hasattr(self.model, 'best_iteration') else len(self.model.get_booster().get_dump())
+        print(f"Final conservative model: {best_iteration} trees, best score: {best_score:.6f}")
+        
+        print("Step 8: Evaluating on validation data...")
+        val_predictions = self.model.predict(X_val_processed)
+        self.evaluation_results = self.comprehensive_evaluation(
+            X_val_prepared, y_val.values, val_predictions
+        )
+        
+        end_time = datetime.now()
+        self.training_metadata.update({
+            'end_time': end_time.isoformat(),
+            'training_duration': str(end_time - start_time),
+            'best_iteration': best_iteration,
+            'best_score': best_score,
+            'xgboost_version': xgb.__version__,
+            'total_features': len(self.feature_names),
+            'parameter_ranges_used': 'conservative_around_R_values'
+        })
+        
+        print(f"\nConservative training completed successfully in {end_time - start_time}")
+        print("="*60)
+        
+        return {
+            "model": self.model,
+            "best_params": self.best_params,
+            "best_score": best_score,
+            "feature_names": self.feature_names,
+            "preprocessor": self.preprocessor,
+            "evaluation_results": self.evaluation_results,
+            "X_train": X_train, "y_train": y_train,
+            "X_val": X_val, "y_val": y_val,
+            "training_metadata": self.training_metadata
+        }
+
+    def predict(self, new_data: pd.DataFrame, feature_columns: List[str]) -> np.ndarray:
+        if self.model is None:
+            raise ValueError("Model not trained yet. Call train_model() first.")
+        if self.preprocessor is None:
+            raise ValueError("Preprocessing pipeline not fitted. Model may not be properly trained.")
+        required_features = [f.upper() for f in feature_columns]
+        X = new_data[required_features]
+        X_processed = self.preprocessor.transform(X)
+        return self.model.predict(X_processed)
+
+    def predict_actual_amounts(self, new_data: pd.DataFrame, feature_columns: List[str]) -> np.ndarray:
+        log_predictions = self.predict(new_data, feature_columns)
+        return 10 ** (log_predictions) - 1
+
+    def comprehensive_evaluation(self, test_features: pd.DataFrame, y_test: np.ndarray, predictions: np.ndarray) -> Dict[str, Any]:
+        basic_metrics = {
+            'rmse': np.sqrt(mean_squared_error(y_test, predictions)),
+            'mae': mean_absolute_error(y_test, predictions),
+            'r2': r2_score(y_test, predictions),
+            'mean_actual': y_test.mean(),
+            'mean_predicted': predictions.mean(),
+            'mean_ratio': predictions.mean() / y_test.mean() if y_test.mean() > 0 else np.nan,
+            'n_test_claims': len(y_test)
+        }
+        
+        actual_amounts = 10 ** (y_test) - 1
+        predicted_amounts = 10 ** (predictions) - 1
+        business_metrics = {
+            'rmse_actual': np.sqrt(mean_squared_error(actual_amounts, predicted_amounts)),
+            'mae_actual': mean_absolute_error(actual_amounts, predicted_amounts),
+            'mape': np.mean(np.abs((actual_amounts - predicted_amounts) / actual_amounts)) * 100,
+            'mean_actual_amount': actual_amounts.mean(),
+            'mean_predicted_amount': predicted_amounts.mean(),
+            'median_actual_amount': np.median(actual_amounts),
+            'median_predicted_amount': np.median(predicted_amounts),
+            'total_actual_amount': actual_amounts.sum(),
+            'total_predicted_amount': predicted_amounts.sum()
+        }
+        
+        yearly_analysis = None
+        if 'WRITN_YEAR' in test_features.columns:
+            test_results = test_features.copy()
+            test_results['predicted_log'] = predictions
+            test_results['actual_log'] = y_test
+            test_results['predicted_amount'] = predicted_amounts
+            test_results['actual_amount'] = actual_amounts
+            yearly_analysis = test_results.groupby('WRITN_YEAR').agg({
+                'actual_log': ['count', 'mean'],
+                'predicted_log': ['mean'],
+                'actual_amount': ['mean', 'sum'],
+                'predicted_amount': ['mean', 'sum']
+            }).round(2)
+        
+        return {
+            'basic_metrics': basic_metrics,
+            'business_metrics': business_metrics,
+            'yearly_analysis': yearly_analysis
+        }
+
+    def get_feature_importance(self, importance_type: str = 'gain') -> pd.DataFrame:
+        if self.model is None:
+            raise ValueError("Model not trained yet.")
+        if hasattr(self.model, 'get_booster'):
+            importance = self.model.get_booster().get_score(importance_type=importance_type)
+        else:
+            importance_values = getattr(self.model, 'feature_importances_', None)
+            if importance_values is None:
+                raise ValueError("No feature importance available from model")
+            importance = dict(zip(self.feature_names, importance_values))
+        
+        importance_df = pd.DataFrame([
+            {'feature': k, 'importance': v}
+            for k, v in importance.items()
+        ])
+        importance_df = importance_df.sort_values('importance', ascending=False)
+        importance_df['rank'] = range(1, len(importance_df) + 1)
+        importance_df['importance_pct'] = (importance_df['importance'] /
+                                           importance_df['importance'].sum() * 100)
+        return importance_df
+
+    def save_model(self, filepath: str):
+        if self.model is None:
+            raise ValueError("Model not trained yet.")
+        model_artifacts = {
+            "model": self.model,
+            "preprocessor": self.preprocessor,
+            "feature_names": self.feature_names,
+            "target_feature": self.target_feature,
+            "objective": self.objective,
+            "eval_metric": self.eval_metric,
+            "monotone_constraints": self.monotone_constraints,
+            "best_params": self.best_params,
+            "evaluation_results": self.evaluation_results,
+            "training_metadata": self.training_metadata,
+            "config": self.config
+        }
+        joblib.dump(model_artifacts, filepath)
+        print(f"Conservative severity model saved to {filepath}")
+
+    def load_model(self, filepath: str):
+        model_artifacts = joblib.load(filepath)
+        self.model = model_artifacts["model"]
+        self.preprocessor = model_artifacts["preprocessor"]
+        self.feature_names = model_artifacts["feature_names"]
+        self.target_feature = model_artifacts["target_feature"]
+        self.objective = model_artifacts["objective"]
+        self.eval_metric = model_artifacts["eval_metric"]
+        self.monotone_constraints = model_artifacts["monotone_constraints"]
+        self.best_params = model_artifacts["best_params"]
+        self.evaluation_results = model_artifacts["evaluation_results"]
+        self.training_metadata = model_artifacts.get("training_metadata", {})
+        self.config = model_artifacts.get("config", ConservativeSeverityModelConfig())
+        print(f"Conservative severity model loaded from {filepath}")
+
+    def plot_feature_importance(self, max_features: int = 20):
+        if self.model is None:
+            raise ValueError("Model not trained yet.")
+        fig, ax = plt.subplots(figsize=(10, 8))
+        if hasattr(self.model, 'get_booster'):
+            xgb.plot_importance(self.model.get_booster(), importance_type='gain',
+                                max_num_features=max_features, ax=ax)
+        else:
+            importance_df = self.get_feature_importance()
+            top_features = importance_df.head(max_features)
+            ax.barh(range(len(top_features)), top_features['importance'])
+            ax.set_yticks(range(len(top_features)))
+            ax.set_yticklabels(top_features['feature'])
+            ax.set_xlabel('Importance')
+        plt.title("Conservative Severity Model - Feature Importance")
+        plt.tight_layout()
+        return fig
+
+    def print_evaluation_summary(self):
+        if self.evaluation_results is None:
+            print("No evaluation results available. Train model first.")
+            return
+        print("="*60)
+        print("CONSERVATIVE SEVERITY MODEL EVALUATION SUMMARY")
+        print("="*60)
+        print("\n1. LOG SCALE METRICS:")
+        for metric, value in self.evaluation_results['basic_metrics'].items():
+            if metric != 'n_test_claims':
+                print(f"   {metric}: {value:.6f}")
+            else:
+                print(f"   {metric}: {value:,}")
+        print("\n2. BUSINESS METRICS (Actual £ Amounts):")
+        for metric, value in self.evaluation_results['business_metrics'].items():
+            if 'amount' in metric:
+                print(f"   {metric}: £{value:,.0f}")
+            elif metric == 'mape':
+                print(f"   {metric}: {value:.1f}%")
+            else:
+                print(f"   {metric}: {value:.3f}")
+        if self.evaluation_results['yearly_analysis'] is not None:
+            print("\n3. YEARLY ANALYSIS:")
+            print(self.evaluation_results['yearly_analysis'])
+
+
+def train_conservative_severity_model(claims_list: pd.DataFrame,
+                                     account_list: pd.DataFrame,
+                                     non_ohe_features: List[str],
+                                     ohe_features: List[str],
+                                     n_trials: int = 30,  # ✅ Conservative number of trials
+                                     save_path: Optional[str] = None) -> ConservativeSeverityModel:
+    """
+    Train a conservative severity model using Bayesian optimization with narrow parameter ranges
+    around R's proven values for stable SHAP curves.
+    """
+    severity_model = ConservativeSeverityModel()
+    results = severity_model.train_model(
+        claims_list,
+        account_list,
+        non_ohe_features,
+        ohe_features,
+        n_trials=n_trials
+    )
+    severity_model.print_evaluation_summary()
+    if save_path:
+        severity_model.save_model(save_path)
+        print(f"\nConservative model saved to: {save_path}")
+    return severity_model
