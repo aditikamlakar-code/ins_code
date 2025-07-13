@@ -1,0 +1,1883 @@
+###############################################################################
+## Project:        Smart Tiering
+## Date:           03/02/2022
+## Author(s):      Guy Hughes
+## Description:    This script groups functions required for training
+##                  machine learning (XgBoost) models for the Smart tiering
+##                  project.
+###############################################################################
+
+source("SCRIPTS/python comparison/Model validation/TIERING_FUNCTIONS_GENERAL_MB_no&&_v2.R")
+
+WD_FILEPATH = function(){ 
+  return(file.path("Q:/NUI/SM/U/CP/CommercialStatistics/CONFIDENTIAL/commercial pricing/2. GCS/4. GCS Projects/2020/Tiering/R_Tiering/AutomatedProcesses"))}
+TRAINING_OUTPUTS_FILEPATH = function(LOB, version){ 
+  return(file.path("Q:/NUI/SM/U/CP/CommercialStatistics/CONFIDENTIAL/commercial pricing/2. GCS/4. GCS Projects/2020/Tiering/R_Tiering/AutomatedProcesses/SCRIPTS/python comparison/Model validation",
+                   LOB, paste0("v",version)))}
+
+###### Section: GENERATE ACCOUNT LIST ######
+GENERATE_ACCOUNT_LIST_USING_FEATURE_LIST = function(policy_list_all, claims_list, year_cutoff,
+                                                    both_non_ohe_features, 
+                                                    both_ohe_features,
+                                                    freq_only_non_ohe_features = c(), 
+                                                    freq_only_ohe_features = c(),
+                                                    sev_only_non_ohe_features = c(), 
+                                                    sev_only_ohe_features = c()
+){
+  features_freq <- unique(c(both_non_ohe_features, both_ohe_features, freq_only_non_ohe_features, freq_only_ohe_features))
+  features_sev <- unique(c(both_non_ohe_features, both_ohe_features, sev_only_non_ohe_features, sev_only_ohe_features))
+  return(GENERATE_ACCOUNT_LIST(policy_list_all, claims_list, year_cutoff,
+                               features_freq, features_sev,
+                               for_renewal = FALSE))
+}
+
+###### Section: DATA SETUP ######
+SETUP_DATA_FOR_MODEL <- function(account_data, target_feature, non_ohe_features, ohe_features){
+  if(length(target_feature) != 1) stop("More than one target feature supplied")
+  
+  all_features <- c(target_feature, non_ohe_features, ohe_features)
+  all_features <- unique(all_features)
+  DATA_FOR_MODEL <- account_data[,..all_features]
+  
+  # if("GWP" %in% all_features){
+  #   DATA_FOR_MODEL <- DATA_FOR_MODEL[GWP > 1000]
+  #   DATA_FOR_MODEL$PREMIUM_BAND <- PREMIUM_BANDING(DATA_FOR_MODEL$GWP)
+  #   DATA_FOR_MODEL <- DATA_FOR_MODEL[,!"GWP"]
+  # }
+  
+  DATA_FOR_MODEL <- as.data.table(lapply(DATA_FOR_MODEL, function(x){
+    if(is.numeric(x)) as.numeric(x)
+    else if (is.factor(x)) as.factor(x)
+    else ifelse(is.na(x), NA, ifelse(x == "", NA, x))
+  }))
+  
+  
+  if("HIST_LR_3YEAR" %in% ohe_features){
+    DATA_FOR_MODEL$HIST_LR_3YEAR <- as.factor(sapply(DATA_FOR_MODEL$HIST_LR_3YEAR, function(x){LR_TO_TIER(x)}))
+  }
+  else if ("HIST_LR_3YEAR" %in% non_ohe_features){
+    DATA_FOR_MODEL$HIST_LR_3YEAR <- ifelse(is.na(DATA_FOR_MODEL$HIST_LR_3YEAR),NA,
+                                           ifelse(DATA_FOR_MODEL$HIST_LR_3YEAR > 1, 1, DATA_FOR_MODEL$HIST_LR_3YEAR))
+  }
+  if("HIST_LR" %in% ohe_features){
+    DATA_FOR_MODEL$HIST_LR <- as.factor(sapply(DATA_FOR_MODEL$HIST_LR, function(x){LR_TO_TIER(x)}))
+  }
+  if("LR_1YEAR" %in% ohe_features){
+    DATA_FOR_MODEL$LR_1YEAR <- as.factor(sapply(DATA_FOR_MODEL$LR_1YEAR, function(x){LR_TO_TIER(x)}))
+  }
+  if("LR_2YEAR" %in% ohe_features){
+    DATA_FOR_MODEL$LR_2YEAR <- as.factor(sapply(DATA_FOR_MODEL$LR_2YEAR, function(x){LR_TO_TIER(x)}))
+  }
+  # if("BROKER_BAND" %in% ohe_features){
+  #   # DATA_FOR_MODEL$BROKER_BAND <- as.factor(DATA_FOR_MODEL$BROKER_BAND)
+  # }
+  
+  # LR_vec <- c("HIST_LR", "HIST_LR_3YEAR", "LR_1YEAR", "LR_2YEAR")
+  # LR_vec <- c("HIST_LR", "LR_1YEAR", "LR_2YEAR")
+  # DATA_FOR_MODEL <- DATA_FOR_MODEL[,-c(which(names(DATA_FOR_MODEL) %in% LR_vec[!(LR_vec %in% poiss_ohe_features)])),with = FALSE]
+  
+  # DATA_FOR_MODEL <- DATA_FOR_MODEL[,!"LR_CURR"]
+  DATA_FOR_MODEL$target <- DATA_FOR_MODEL[[target_feature]]
+  DATA_FOR_MODEL <- DATA_FOR_MODEL[,!..target_feature]
+  # DATA_FOR_MODEL <- DATA_FOR_MODEL[,!c("NB_OR_RN")]
+  # DATA_FOR_MODEL <- DATA_FOR_MODEL[,!c("DOMICILE", "INSD_NM", "WRITN_YEAR", "GWP", "GCS_TIER", "INCURRED", "NumTiers")]
+  # DATA_FOR_MODEL <- DATA_FOR_MODEL[,!c("CSR_REGION")]
+  # DATA_FOR_MODEL <- DATA_FOR_MODEL[,!c("HIST_LR_1YEAR")]
+  
+  #Setting character fields to factors
+  for(i in 1:length(names(DATA_FOR_MODEL))){
+    if(is.character(DATA_FOR_MODEL[[i]])){
+      DATA_FOR_MODEL[[i]] <- as.factor(DATA_FOR_MODEL[[i]])
+    }
+  }
+  
+  #Percentage of data used for training. The rest will be used to test the final model.
+  pct_training <- 0.7
+  dummies <- dummyVars(as.formula(paste0("~ ", paste0(ohe_features, collapse = " + "))), data = DATA_FOR_MODEL)
+  DATA_OHE <- as.data.table(predict(dummies, newdata = DATA_FOR_MODEL))
+  DATA_ALL <- cbind(DATA_FOR_MODEL[,-c(which(names(DATA_FOR_MODEL) %in% ohe_features)), with = FALSE], DATA_OHE)
+  
+  DATA_ALL <- as.data.table(lapply(DATA_ALL, as.numeric))
+  
+  # Remove columns with few member cases.
+  DATA_ALL <- as.data.table(apply(DATA_ALL, 2, function(x){
+    if(sum(x>0,na.rm=T) >= 100){
+      x
+    }
+  }))
+  #Partition into training and test data
+  set.seed(12)
+  index <- createDataPartition(DATA_ALL$target, p = pct_training, list = FALSE)
+  DATA_VARIABLES <- as.matrix(DATA_ALL[,!"target"])
+  colnames(DATA_VARIABLES) <- names(DATA_ALL[,!"target"])
+  
+  DATA_LABEL <- DATA_ALL[,"target"]
+  DATA_MATRIX <- xgb.DMatrix(data = DATA_VARIABLES, label = t(DATA_LABEL))
+  TRAIN_MATRIX <<- xgb.DMatrix(data = DATA_VARIABLES[index,], label = t(DATA_LABEL[index,]))
+  TEST_MATRIX <<- xgb.DMatrix(data = DATA_VARIABLES[-index,], label = t(DATA_LABEL[-index,]))
+  
+  # DATA_MATRIX <- as.matrix(DATA_VARIABLES, rownames = t(DATA_LABEL))
+  # TRAIN_MATRIX <- as.matrix(DATA_VARIABLES[index,], rownames = t(DATA_LABEL[index,]))
+  # TEST_MATRIX <- as.matrix(DATA_VARIABLES[-index,], rownames = t(DATA_LABEL[-index,]))
+  
+  list("data" = DATA_VARIABLES, 
+       "index" = index, 
+       "data_list" = account_data, 
+       "data_all" = DATA_ALL, 
+       "ohe_features" = ohe_features,
+       "train_matrix" = TRAIN_MATRIX,
+       "test_matrix" = TEST_MATRIX)
+       #"data_matrix" = DATA_MATRIX)  # MB added for use in CV_XGB_MB
+}
+
+###### Section: MB (HYPERPARAMETERS) ######
+# Caret cross-validation is used to get the optimal hyperparameters for the model,
+# which can then be used in an XGboost model (in the frequency or severity section below)
+# to generate the final model.
+CV_XGB_MB <- function(account_data, target_feature, non_ohe_features, ohe_features, param_grid){
+  # Function to perform grid search
+  LIST_SETUP_DATA_FOR_MODEL = SETUP_DATA_FOR_MODEL(account_data, target_feature, non_ohe_features, ohe_features)
+  
+  
+  # Initialize variables to store the best results
+  best_params <- NULL
+  best_score <- Inf
+  
+  set.seed(12)
+  # Iterate over all combinations of parameters
+  for (eta in param_grid$eta) {
+    for (max_depth in param_grid$max_depth) {
+      for (gamma in param_grid$gamma) {
+        for (min_child_weight in param_grid$min_child_weight) {
+          for (subsample in param_grid$subsample) {
+            for (colsample_bytree in param_grid$colsample_bytree) {
+              
+              # Set parameters
+              params <- list(
+                objective = param_grid$objective,
+                # num_class = length(unique(label)),
+                eval_metric = param_grid$eval_metric,
+                eta = eta,
+                max_depth = max_depth,
+                gamma = gamma,
+                min_child_weight = min_child_weight,
+                subsample = subsample,
+                colsample_bytree = colsample_bytree
+              )
+              
+              # Perform cross-validation
+              cv_results <- xgb.cv(
+                params = params,
+                data = LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]],
+                nrounds = 1000,
+                nfold = 5,
+                # showsd = TRUE,
+                # stratified = TRUE,
+                # print_every_n = 10,
+                early_stopping_rounds = 10,
+                maximize = FALSE,
+                verbose = 0
+              )
+              
+              # Get the best score
+              mean_score <- ifelse(param_grid$objective == "reg:gamma",min(cv_results$evaluation_log$test_rmse_mean),
+                                   min(cv_results$evaluation_log$test_rmsle_mean)) 
+              # mean_score <- min(f("cv_results$evaluation_log$test_{param_grid$eval_metric}_mean"))
+              
+              # Update best parameters if current score is better
+              if (mean_score < best_score) {
+                best_score <- mean_score
+                best_params <- params
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  # Now train the final model
+  # xgb_model <- xgb.train(params = best_params,
+  #                        data = ,
+  #                        nrounds)
+  
+  return(#list(best_params = best_params, best_score = best_score)
+    list(#"model" = xgb_model, 
+      "params" = best_params,
+      "data" = LIST_SETUP_DATA_FOR_MODEL[["data"]], 
+      "index" = LIST_SETUP_DATA_FOR_MODEL[["index"]], 
+      "data_list" = LIST_SETUP_DATA_FOR_MODEL[["data_list"]], 
+      "data_all" = LIST_SETUP_DATA_FOR_MODEL[["data_all"]], 
+      "target_feature" = target_feature,
+      "non_ohe_features" = non_ohe_features,
+      "ohe_features" = LIST_SETUP_DATA_FOR_MODEL[["ohe_features"]]))
+}
+
+TUNE_MODELS_MB = function(account_list, claims_account_list,
+                          both_non_ohe_features, both_ohe_features,
+                          freq_only_non_ohe_features = c(), freq_only_ohe_features = c(),
+                          sev_only_non_ohe_features = c(), sev_only_ohe_features = c()){
+  # The features for the model (target, non_ohe and ohe features) must be set before running this.
+  # Non-OHE features must be numeric.
+  # OHE features can be categoric and will be separated out into multiple numeric (0-1) columns.
+  
+  freq_target_feature <- "num_losses"
+  freq_non_ohe_features = unique(c(both_non_ohe_features, freq_only_non_ohe_features))
+  freq_ohe_features = unique(c(both_ohe_features, freq_only_ohe_features))
+  
+  sev_target_feature <- "LOG_INCURRED"
+  sev_non_ohe_features = unique(c(both_non_ohe_features, sev_only_non_ohe_features))
+  sev_ohe_features = unique(c(both_ohe_features, sev_only_ohe_features))
+  
+  set.seed(12)
+  freq_cv_model <- CV_XGB_MB(account_list,
+                              freq_target_feature,
+                              freq_non_ohe_features,
+                              freq_ohe_features,
+                              param_grid = list(objective = "count:poisson",
+                                                booster = "gbtree",
+                                                eval_metric = "rmsle",
+                                                # nrounds = c(100),
+                                                eta = c(0.1),
+                                                max_depth = c(4),
+                                                colsample_bytree = c(0.65),
+                                                gamma = c(0.05),
+                                                min_child_weight = c(1.1),
+                                                subsample = c(0.6))
+  )  
+  
+  set.seed(12)
+  sev_cv_model <- CV_XGB_MB(claims_account_list, 
+                             sev_target_feature, 
+                             sev_non_ohe_features, 
+                             sev_ohe_features,
+                             param_grid = list(objective = "reg:gamma",
+                                               booster = "gbtree",
+                                               eval_metric = "rmse",
+                                               # nrounds = c(100),
+                                               eta = c(0.1),
+                                               max_depth = c(2),
+                                               colsample_bytree = c(1),
+                                               gamma = c(0.05),
+                                               min_child_weight = c(1),
+                                               subsample = c(0.9))
+  )
+  return(list(freq_cv_model = freq_cv_model,
+              sev_cv_model = sev_cv_model))
+}
+
+###### Section: MB GENERATING MODELS ######
+
+GENERATE_MODEL_SINGLE_MB = function(account_data, 
+                                    xgb_objective, 
+                                    xgb_eval_metric,
+                                    cv_model){
+  #New number losses
+  LIST_SETUP_DATA_FOR_MODEL <- SETUP_DATA_FOR_MODEL(account_data, cv_model$target_feature, cv_model$non_ohe_features, cv_model$ohe_features)
+  DATA_ALL <- LIST_SETUP_DATA_FOR_MODEL[["data_all"]]
+  monotone <- paste0("(", paste0(ifelse(names(DATA_ALL[,!"target"]) %like% "A. Below", -1,
+                                        ifelse(names(DATA_ALL[,!"target"]) %like% "B. From ", 1,
+                                               ifelse(names(DATA_ALL[,!"target"]) %like% "C. Over", 1,
+                                                      ifelse(names(DATA_ALL[,!"target"]) %like% "D. Unknown", 1,
+                                                             ifelse(names(DATA_ALL[,!"target"]) %like% "LR_3YEAR", 1,
+                                                                    0))))), collapse = ","), ")")
+  xgb_params <- list("objective" = xgb_objective,
+                     "eval_metric" = xgb_eval_metric,
+                     "booster" = "gbtree",
+                     "tree_method" = "exact",
+                     "monotone_constraints" = monotone,
+                     "max_depth" = cv_model$params$max_depth,
+                     "colsample_bytree" = cv_model$params$colsample_bytree,
+                     "eta" = cv_model$params$eta,
+                     "gamma" = cv_model$params$gamma,
+                     "max_delta_step" = 0.8,
+                     "min_child_weight" = cv_model$params$min_child_weight,
+                     "subsample" = cv_model$params$subsample)
+  
+  #Set up validation set, taking 80% of the train set.
+  pct_val <- 0.8
+  
+  DATA_LABEL <- DATA_ALL[,"target"]
+  
+  train_index <- createDataPartition(LIST_SETUP_DATA_FOR_MODEL[["index"]], p = pct_val, list = FALSE)
+  val_index <- setdiff(1:dim(LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]])[1], 
+                       train_index)
+  # m_train <- xgb.DMatrix(LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]][train_index,], label = t(DATA_LABEL[train_index,]))
+  # m_val <- xgb.DMatrix(LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]][val_index,], label = t(DATA_LABEL[val_index,]))
+  # m_train <- xgb.DMatrix(TRAIN_MATRIX[train_index,], label = t(DATA_LABEL[train_index,]))
+  # m_val <- xgb.DMatrix(TRAIN_MATRIX[val_index,], label = t(DATA_LABEL[val_index,]))
+  m_train <- slice(TRAIN_MATRIX,train_index)
+  m_val <- slice(TRAIN_MATRIX,val_index)
+  colnames(m_train) <- names(LIST_SETUP_DATA_FOR_MODEL$data_all[,!"target"])
+  colnames(m_val) <- names(LIST_SETUP_DATA_FOR_MODEL$data_all[,!"target"])
+  
+  # DATA_MATRIX <- xgb.DMatrix(data = DATA_VARIABLES, label = t(DATA_LABEL))
+  # TRAIN_MATRIX <- xgb.DMatrix(data = DATA_VARIABLES[index,], label = t(DATA_LABEL[index,]))
+  # TEST_MATRIX <- xgb.DMatrix(data = DATA_VARIABLES[-index,], label = t(DATA_LABEL[-index,]))
+  
+  # #max =T for AUC, max=F for error.
+  final_model <- xgb.train(params = xgb_params,
+                           data = m_train,
+                           nrounds = 10000,
+                           verbose = T,
+                           maximize = F,
+                           watchlist = list(train = m_train, 
+                                            eval = m_val),
+                           early_stopping_rounds = 50)
+  
+  list("model" = final_model, 
+       "data" = LIST_SETUP_DATA_FOR_MODEL[["data"]], 
+       "index" = LIST_SETUP_DATA_FOR_MODEL[["index"]], 
+       "data_list" = LIST_SETUP_DATA_FOR_MODEL[["data_list"]], 
+       "data_all" = LIST_SETUP_DATA_FOR_MODEL[["data_all"]], 
+       "target_feature" = cv_model$target_feature,
+       "non_ohe_features" = cv_model$non_ohe_features,
+       "ohe_features" = LIST_SETUP_DATA_FOR_MODEL[["ohe_features"]])
+}
+
+GENERATE_FREQ_SEV_MODELS_MB = function(account_list, claims_account_list,
+                                       both_non_ohe_features, both_ohe_features,
+                                       freq_only_non_ohe_features = c(), freq_only_ohe_features = c(),
+                                       sev_only_non_ohe_features = c(), sev_only_ohe_features = c()){
+  # Applied XGB tuning to get the required hyperparameters,
+  # then trains an XgBoost model based on those hyperparameters
+  # (and features).
+  tuned = TUNE_MODELS_MB(account_list,
+                         claims_account_list,
+                         both_non_ohe_features, both_ohe_features,
+                         freq_only_non_ohe_features, freq_only_ohe_features,
+                         sev_only_non_ohe_features, sev_only_ohe_features
+  )
+  print("Models tuned.")
+  freq_model <- GENERATE_MODEL_SINGLE_MB(account_list,
+                                          xgb_objective = "count:poisson",
+                                          xgb_eval_metric = "rmsle",
+                                          cv_model = tuned$freq_cv_model)
+  print("Freq model generated.")
+  sev_model <- GENERATE_MODEL_SINGLE_MB(claims_account_list,
+                                         xgb_objective = "reg:gamma",
+                                         xgb_eval_metric = "rmse",
+                                         cv_model = tuned$sev_cv_model)
+  print("Sev model generated.")
+  
+  return(list(freq_model = freq_model,
+              sev_model = sev_model))
+}
+
+###### Section: CARET (HYPERPARAMETERS) ######
+# Caret cross-validation is used to get the optimal hyperparameters for the model,
+# which can then be used in an XGboost model (in the frequency or severity section below)
+# to generate the final model.
+CV_CARET <- function(account_data, target_feature, non_ohe_features, ohe_features, grid){
+  LIST_SETUP_DATA_FOR_MODEL = SETUP_DATA_FOR_MODEL(account_data, target_feature, non_ohe_features, ohe_features)
+  
+  
+  xgb_trcontrol = trainControl(
+    method = "cv",
+    nfold = 5,
+    allowParallel = TRUE,
+    verboseIter = TRUE,
+    returnData = FALSE
+  )
+  
+  
+  y = LIST_SETUP_DATA_FOR_MODEL[["data_all"]][LIST_SETUP_DATA_FOR_MODEL[["index"]],]$target
+  
+  set.seed(12)
+  xgb_model = train(
+    LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]], y,
+    trControl = xgb_trcontrol,
+    tuneGrid = grid,
+    method = "xgbTree"
+  )
+  
+  return(list("model" = xgb_model, 
+              "data" = LIST_SETUP_DATA_FOR_MODEL[["data"]], 
+              "index" = LIST_SETUP_DATA_FOR_MODEL[["index"]], 
+              "data_list" = LIST_SETUP_DATA_FOR_MODEL[["data_list"]], 
+              "data_all" = LIST_SETUP_DATA_FOR_MODEL[["data_all"]], 
+              "target_feature" = target_feature,
+              "non_ohe_features" = non_ohe_features,
+              "ohe_features" = LIST_SETUP_DATA_FOR_MODEL[["ohe_features"]]))
+}
+
+
+GENERATE_CLAIM_ACCOUNT_LIST = function(claims_list,
+                                       account_list){
+  # A claims list in the format required for tiering.
+  claims_account_list = merge(claims_list[,.(INSD_NM, CLM_CUST_POL_REF, CL_LOB_5, CLM_REF, WRITN_YEAR, INCURRED, LEVELLED_INCURRED, 
+                                             CAT_FLAG)], 
+                              account_list, 
+                              by = c("INSD_NM", "CL_LOB_5", "WRITN_YEAR"), all.x=T, all.y=F)
+  
+  claims_account_list = claims_account_list[INSD_NM != ""]
+  claims_account_list = claims_account_list[INCURRED > 10]
+  
+  claims_account_list[, LOG_INCURRED := log10(1+LEVELLED_INCURRED)]
+  return(claims_account_list)
+}
+
+TUNE_MODELS = function(account_list, claims_account_list,
+                       both_non_ohe_features, both_ohe_features,
+                       freq_only_non_ohe_features = c(), freq_only_ohe_features = c(),
+                       sev_only_non_ohe_features = c(), sev_only_ohe_features = c()){
+  # The features for the model (target, non_ohe and ohe features) must be set before running this.
+  # Non-OHE features must be numeric.
+  # OHE features can be categoric and will be separated out into multiple numeric (0-1) columns.
+  
+  freq_target_feature <- "num_losses"
+  freq_non_ohe_features = unique(c(both_non_ohe_features, freq_only_non_ohe_features))
+  freq_ohe_features = unique(c(both_ohe_features, freq_only_ohe_features))
+  
+  sev_target_feature <- "LOG_INCURRED"
+  sev_non_ohe_features = unique(c(both_non_ohe_features, sev_only_non_ohe_features))
+  sev_ohe_features = unique(c(both_ohe_features, sev_only_ohe_features))
+  
+  set.seed(12)
+  freq_cv_model <- CV_CARET(account_list,
+                            freq_target_feature,
+                            freq_non_ohe_features,
+                            freq_ohe_features,
+                            expand.grid(nrounds = c(100),
+                                        eta = c(0.01),
+                                        max_depth = c(4),
+                                        colsample_bytree = c(0.8),
+                                        gamma = c(0),
+                                        min_child_weight = c(1),
+                                        subsample = c(1)))  
+  
+  set.seed(12)
+  sev_cv_model <- CV_CARET(claims_account_list, 
+                           sev_target_feature, 
+                           sev_non_ohe_features, 
+                           sev_ohe_features,
+                           expand.grid(nrounds = c(100),
+                                       eta = c(0.1),
+                                       max_depth = c(2),
+                                       colsample_bytree = c(0.8),
+                                       gamma = c(0),
+                                       min_child_weight = c(1),
+                                       subsample = c(1)))
+  return(list(freq_cv_model = freq_cv_model,
+              sev_cv_model = sev_cv_model))
+}
+
+
+###### Section: GENERATING MODELS ######
+GENERATE_MODEL_SINGLE = function(account_data, 
+                                 xgb_objective, 
+                                 xgb_eval_metric,
+                                 cv_model){
+  #New number losses
+  LIST_SETUP_DATA_FOR_MODEL <- SETUP_DATA_FOR_MODEL(account_data, cv_model$target_feature, cv_model$non_ohe_features, cv_model$ohe_features)
+  DATA_ALL <- LIST_SETUP_DATA_FOR_MODEL[["data_all"]]
+  monotone <- paste0("(", paste0(ifelse(names(DATA_ALL[,!"target"]) %like% "A. Below", -1,
+                                        ifelse(names(DATA_ALL[,!"target"]) %like% "B. From ", 1,
+                                               ifelse(names(DATA_ALL[,!"target"]) %like% "C. Over", 1,
+                                                      ifelse(names(DATA_ALL[,!"target"]) %like% "D. Unknown", 1,
+                                                             ifelse(names(DATA_ALL[,!"target"]) %like% "LR_3YEAR", 1,
+                                                                    0))))), collapse = ","), ")")
+  xgb_params <- list("objective" = xgb_objective,
+                     "eval_metric" = xgb_eval_metric,
+                     "booster" = "gbtree",
+                     "tree_method" = "exact",
+                     "monotone_constraints" = monotone,
+                     "max_depth" = cv_model$model$bestTune$max_depth,
+                     "colsample_bytree" = cv_model$model$bestTune$colsample_bytree,
+                     "eta" = cv_model$model$bestTune$eta,
+                     "gamma" = cv_model$model$bestTune$gamma,
+                     "max_delta_step" = 0.8,
+                     "min_child_weight" = cv_model$model$bestTune$min_child_weight,
+                     "subsample" = cv_model$model$bestTune$subsample)
+  
+  #Set up validation set, taking 80% of the train set.
+  pct_val <- 0.8
+  
+  DATA_LABEL <- DATA_ALL[,"target"]
+  
+  train_index <- createDataPartition(LIST_SETUP_DATA_FOR_MODEL[["index"]], p = pct_val, list = FALSE)
+  val_index <- setdiff(1:dim(LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]])[1], 
+                       train_index)
+  m_train <- xgb.DMatrix(LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]][train_index,], label = t(DATA_LABEL[train_index,]))
+  m_val <- xgb.DMatrix(LIST_SETUP_DATA_FOR_MODEL[["train_matrix"]][val_index,], label = t(DATA_LABEL[val_index,]))
+  colnames(m_train) <- names(LIST_SETUP_DATA_FOR_MODEL$data_all[,!"target"])
+  colnames(m_val) <- names(LIST_SETUP_DATA_FOR_MODEL$data_all[,!"target"])
+  
+  # DATA_MATRIX <- xgb.DMatrix(data = DATA_VARIABLES, label = t(DATA_LABEL))
+  # TRAIN_MATRIX <- xgb.DMatrix(data = DATA_VARIABLES[index,], label = t(DATA_LABEL[index,]))
+  # TEST_MATRIX <- xgb.DMatrix(data = DATA_VARIABLES[-index,], label = t(DATA_LABEL[-index,]))
+  
+  # #max =T for AUC, max=F for error.
+  final_model <- xgb.train(params = xgb_params,
+                           data = m_train,
+                           nrounds = 10000,
+                           verbose = T,
+                           maximize = F,
+                           watchlist = list(train = m_train, 
+                                            eval = m_val),
+                           early_stopping_rounds = 50)
+  
+  list("model" = final_model, 
+       "data" = LIST_SETUP_DATA_FOR_MODEL[["data"]], 
+       "index" = LIST_SETUP_DATA_FOR_MODEL[["index"]], 
+       "data_list" = LIST_SETUP_DATA_FOR_MODEL[["data_list"]], 
+       "data_all" = LIST_SETUP_DATA_FOR_MODEL[["data_all"]], 
+       "target_feature" = cv_model$target_feature,
+       "non_ohe_features" = cv_model$non_ohe_features,
+       "ohe_features" = LIST_SETUP_DATA_FOR_MODEL[["ohe_features"]])
+}
+
+
+GENERATE_FREQ_SEV_MODELS = function(account_list, claims_account_list,
+                                    both_non_ohe_features, both_ohe_features,
+                                    freq_only_non_ohe_features = c(), freq_only_ohe_features = c(),
+                                    sev_only_non_ohe_features = c(), sev_only_ohe_features = c()){
+  # Applied CARET tuning to get the required hyperparameters,
+  # then trains an XgBoost model based on those hyperparameters
+  # (and features).
+  tuned = TUNE_MODELS(account_list,
+                      claims_account_list,
+                      both_non_ohe_features, both_ohe_features,
+                      freq_only_non_ohe_features, freq_only_ohe_features,
+                      sev_only_non_ohe_features, sev_only_ohe_features)
+  print("Models tuned.")
+  freq_model = GENERATE_MODEL_SINGLE(account_list,
+                                     xgb_objective = "count:poisson",
+                                     xgb_eval_metric = "rmsle",
+                                     cv_model = tuned$freq_cv_model)
+  print("Freq model generated.")
+  sev_model = GENERATE_MODEL_SINGLE(claims_account_list,
+                                    xgb_objective = "reg:gamma",
+                                    xgb_eval_metric = "rmse",
+                                    cv_model = tuned$sev_cv_model)
+  print("Sev model generated.")
+  # freq_model <- models$freq_model
+  # sev_model <- models$sev_model
+  
+  return(list(freq_model = freq_model,
+              sev_model = sev_model))
+}
+
+
+###### Section: GENERATING PREDICTIONS ######
+GENERATE_PREDICTIONS_FROM_MODEL <- function(model_list, data_list, for_renewal = TRUE, shap_values = FALSE){
+  # Apply model 'model' to data set 'data_list'
+  # to generate a prediction for the target variable
+  # of model.
+  # For the frequency model, this will return a column
+  # vector of predicted number of losses, corresponding
+  # to each row in data_list.
+  # For the severity model, this will return a column
+  # vector of predicted average claim size, corresponding
+  # to each row in data_list.
+  input <- data_list
+  # input$DEVELOPMENT <- max(input$DEVELOPMENT,na.rm=T)
+  # We set the development to max when generating predictions
+  # since we want the future view of this account: i.e.
+  # we assume that it has no fully developed.
+  if(for_renewal){
+    input$DEVELOPMENT <- max(input$DEVELOPMENT)
+  }
+  
+  ohe_features = model_list$ohe_features
+  # if(model$params$objective %like% "gamma"){
+  #   ohe_features <- gamma_ohe_features
+  # }
+  # else{
+  #   ohe_features <- poiss_ohe_features
+  # }
+  
+  for(factor in ohe_features){
+    input[[factor]] <- as.factor(input[[factor]])
+  }
+  dummies <- dummyVars(paste0("~ ", paste0(ohe_features, collapse = " + ")), data = input)
+  
+  DATA_OHE <- as.data.table(predict(dummies, newdata = input))
+  DATA_ALL <- cbind(input[,-c(which(names(input) %in% ohe_features)), with = FALSE], DATA_OHE)
+  
+  # Grab only the columns which are used in this model.
+  DATA_ALL <- DATA_ALL[,c(which(names(DATA_ALL) %in% model_list$model$feature_names)), with = FALSE]
+  # Create blank columns of the additional columns needed in model that were not found in this data.
+  missing_factors <- model_list$model$feature_names[!(model_list$model$feature_names %in% names(DATA_ALL))]
+  if(length(missing_factors) > 0) {
+    DATA_ALL[, (missing_factors) := 0]
+  }  
+  
+  # Redorder columns to correlate with set-order in model
+  setcolorder(DATA_ALL, model_list$model$feature_names)
+  
+  if(!shap_values){
+    return(predict(model_list$model, xgb.DMatrix(data = as.matrix(DATA_ALL))))
+  }
+  else{
+    return(as.data.table(predict(model_list$model, xgb.DMatrix(data = as.matrix(DATA_ALL)), predcontrib = TRUE, approxcontrib = FALSE)))
+  }
+}
+
+GENERATE_ACCOUNT_TIERS <- function(data_list, freq_model, sev_model,
+                                   renewal = FALSE,
+                                   tiering_type = "GWP",
+                                   tiering_assignment = c(0.15, 0.7),
+                                   save_tier_thresholds = FALSE){
+  # Takes a data.table 'data_list' and generates predictions
+  # for number of losses (frequency) and average claim size (severity).
+  # These predictions are multiplied together to predict an incurred,
+  # which is then divided by the account's premium to predict
+  # a loss ratio.
+  # This predicted LR is then used to tier the account.
+  # These results are returned as a new data.table,
+  # with these values appended to the values from data_list.
+  
+  # The input 'renewal' determines whether tiers and thresholds
+  # are assigned for the given account's year (FALSE) or for 
+  # the renewal of that year (TRUE). If renewal is FALSe, then
+  # we replace GWP with the previous year's GWP; if renewal is TRUE, 
+  # then we make the following changes:
+  # (i) TENURE increases by one (to include the expiring year).
+  # (ii) CURR_HIST_LR_3YEAR is used instead of
+  # HIST_LR_3YEAR This means that the expiring year and
+  # two prior years are used in the historical loss ratio 
+  # calulcation (i.e. the expiring year is included).
+  # Otherwise, the three years prior are used for LR (current
+  # year is not included.)
+  # Renewal TRUE is used when assigning tiers upon renewal (once the
+  # models are live), whereas renewal FALSE is used to generate
+  # the tier thresholds.
+  
+  # The input 'tiering_type' determines how tiers will be assigned:
+  # whether by a pre-assigned set of thresholds or by a GWP splitting.
+  # The input 'tiering_assignment' must be a two-valued vector
+  # which determines either the l_bound and m_bound thresholds
+  # for predicted LR or the desired Tier 1 and Tier 2 GWP proportions.
+  # The default values: tiering_type = "GWP" and 
+  # tiering_assignment = c(0.15, 0.7) will return tiers based on GWP
+  # splitting, assigned 15% to Tier 1, 70% to tier 2, and 15% to tier 3.
+  
+  # When applying GWP splitting, the optional parameter save_tier_threshold
+  # can be used to save the tier thresholds that have been generated.
+  # If a non-NA variable is passed in here, then it is overwritten with the
+  # tier thresholds.
+  
+  tiering_data <- data_list[GWP > 1]
+  
+  if(renewal){
+    # If this is renewal tiering, we need to include the current (expiring)
+    # year in the historical loss ratio and we need to increase tenure
+    # by 1 (since it has now been with us another year).
+    tiering_data$HIST_LR_3YEAR <- tiering_data$CURR_HIST_LR_3YEAR
+    tiering_data$TENURE <- tiering_data$TENURE + 1
+  }
+  else{
+    # Replace GWP with the prior year's (expiring) GWP
+    # if we are not doing renewal tiering.
+    tiering_data$current_GWP <- tiering_data$LEVELLED_GWP
+    # tiering_data$GWP <- apply(tiering_data, 1, function(x) {
+    #   tiering_data[INSD_NM == x[["INSD_NM"]] & (WRITN_YEAR == as.numeric(x[["WRITN_YEAR"]]) - 1),
+    #                    sum(GWP,na.rm=T)]
+    # })
+    # Replace the GWP by the previous year's GWP
+    # tiering_data$LEVELLED_GWP <- GET_HIST_VALUE(data_total = tiering_data,
+    #                                    data_for_summary = tiering_data,
+    #                                    summarizeBy = c("INSD_NM", "CL_LOB_5"),
+    #                                    column_to_summarize = "LEVELLED_GWP",
+    #                                    sumval = TRUE,
+    #                                    numberYears = 1, 
+    #                                    includeCurrentYear = FALSE)
+    tiering_data <- tiering_data[LEVELLED_GWP > 0,]
+  }
+  
+  # Generate predicted LR.
+  tiering_data$predicted_num_losses <- GENERATE_PREDICTIONS_FROM_MODEL(freq_model, tiering_data)
+  # The output of the gamma model is the log10 of the claim size, so need to exponentiate it.
+  tiering_data$predicted_claim_size <- 10 ^ (GENERATE_PREDICTIONS_FROM_MODEL(sev_model, tiering_data) + 1)
+  tiering_data$predicted_incurred <- tiering_data$predicted_num_losses * tiering_data$predicted_claim_size
+  tiering_data$predicted_LR <- tiering_data$predicted_incurred / tiering_data$GWP
+  
+  if(renewal){
+    
+  }
+  else{
+    # Bring back the actual GWP, but save last year's
+    # GWP as expiring_GWP
+    tiering_data$expiring_GWP <- tiering_data$LEVELLED_GWP
+    tiering_data$LEVELLED_GWP <- tiering_data$current_GWP
+    tiering_data <- tiering_data[,!"current_GWP"]
+  }
+  
+  # Calculate the actual experienced loss ratio, for validation purposes.
+  # This is not necessary for renewal tiering, since we do not 
+  # know its loss ratio yet (since the policy has not yet been written).
+  tiering_data$actual_LR <- tiering_data$CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT / tiering_data$LEVELLED_GWP
+  
+  # Assign tiers using the predicted LR, according to the input parameters:
+  if(tiering_type == "GWP"){
+    # We are doing tiering by GWP splitting.
+    # Use tiering_assignment as the GWP splitting proportions.
+    tiering_data$pred_TIER <- ASSIGN_TIER_PCT(tiering_data[,.(predicted_LR, GWP = LEVELLED_GWP)], tiering_assignment)
+    if(save_tier_thresholds){
+      # If the user has passed a non-NA data container here, 
+      # then we overwrite it with the tier thresholds from this tiering.
+      save_tier_thresholds <<- GET_TIER_PCT_THRESHOLDS(tiering_data[,.(predicted_LR, GWP = LEVELLED_GWP)], tiering_assignment)
+    }
+  }
+  else if (tiering_type == "LR"){
+    # We are doing tiering by pre-set LR thresholds.
+    # Use the first and second value of tiering_assignment as the
+    # lower and middle thresholds.
+    tiering_data$pred_TIER <- ASSIGN_TIER(tiering_data$predicted_LR, 
+                                          tiering_assignment[1],
+                                          tiering_assignment[2])
+    
+    save_tier_thresholds <<- tiering_assignment
+  }
+  else{
+    # Invalid type so through an error.
+    stop(paste0("Error: Invalid tiering_type '", 
+                tiering_type, 
+                "'. Please choose either GWP or LR."))
+  }
+  
+  # Return the results.
+  return(tiering_data)
+}
+
+
+###### Section: TESTING ######
+MODEL_BACKTESTING = function(account_list, freq_model_list, sev_model_list, 
+                             yr = 2015:2020, tiering_type = "GWP", tiering_assignment = c(0.15, 0.7)){
+  TIERING_DATA_ALL = GENERATE_ACCOUNT_TIERS(account_list, 
+                                            freq_model_list, 
+                                            sev_model_list,
+                                            renewal = FALSE,
+                                            tiering_type = tiering_type,
+                                            tiering_assignment = tiering_assignment,
+                                            save_tier_thresholds = TRUE
+  )
+  
+  c = sum(TIERING_DATA_ALL$CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT,na.rm=T)/sum(TIERING_DATA_ALL$predicted_incurred,na.rm=T)
+  a = TIERING_DATA_ALL[WRITN_YEAR %in% yr, .(pct = 100*(.N/TIERING_DATA_ALL[WRITN_YEAR %in% yr,.N]),
+                                             pctGWP = 100*sum(LEVELLED_GWP,na.rm=T)/TIERING_DATA_ALL[WRITN_YEAR %in% yr,sum(LEVELLED_GWP, na.rm=T)],
+                                             median_losses_pred = round(median(predicted_num_losses,na.rm=T),1),
+                                             incurred_pred = sum(predicted_incurred, na.rm=T),
+                                             median_losses_actual = median(num_losses,na.rm=T),
+                                             incurred_actual = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT,na.rm=T),
+                                             GWP = sum(LEVELLED_GWP, na.rm=T),
+                                             predictedLR = c * sum(predicted_incurred,na.rm=T)/sum(LEVELLED_GWP,na.rm=T),
+                                             actualLR = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT,na.rm=T)/sum(LEVELLED_GWP,na.rm=T),
+                                             median_actual_LR = median(actual_LR)
+  ), 
+  by = .(pred_TIER)][order(pred_TIER)]
+  
+  # Generate the same values but for the current tiering process (GCS_TIER).
+  b = TIERING_DATA_ALL[WRITN_YEAR %in% yr, .(pct = 100*(.N/TIERING_DATA_ALL[WRITN_YEAR %in% yr,.N]),
+                                             pctGWP = 100*sum(LEVELLED_GWP,na.rm=T)/TIERING_DATA_ALL[WRITN_YEAR %in% yr,sum(LEVELLED_GWP,na.rm=T)],
+                                             median_losses_actual = median(num_losses,na.rm=T),
+                                             incurred_actual = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT,na.rm=T),
+                                             GWP = sum(LEVELLED_GWP, na.rm=T),
+                                             actualLR = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT,na.rm=T)/sum(LEVELLED_GWP,na.rm=T)), 
+                       by = .(GCS_TIER)][order(GCS_TIER)]
+  
+  ay = TIERING_DATA_ALL[,
+                       .(GWP = sum(LEVELLED_GWP, na.rm=T),
+                         Incurred = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT, na.rm=T),
+                         predictedLR = c * sum(predicted_incurred,na.rm=T)/sum(LEVELLED_GWP,na.rm=T),
+                         actualLR = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT,na.rm=T)/sum(LEVELLED_GWP,na.rm=T)),
+                       by = c("pred_TIER", "WRITN_YEAR")][order(pred_TIER)][order(WRITN_YEAR)]
+  
+  by = TIERING_DATA_ALL[,
+                       .(GWP = sum(LEVELLED_GWP, na.rm=T),
+                         Incurred = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT, na.rm=T),
+                         predictedLR = c * sum(predicted_incurred,na.rm=T)/sum(LEVELLED_GWP,na.rm=T),
+                         actualLR = sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT,na.rm=T)/sum(LEVELLED_GWP,na.rm=T)),
+                       by = c("GCS_TIER", "WRITN_YEAR")][order(GCS_TIER)][order(WRITN_YEAR)]
+  
+  return(list("Smart" = a,
+              "Current" = b,
+              "Smart Yearly" = ay,
+              "Current Yearly" = by,
+              "Pure Thresholds" = save_tier_thresholds,
+              "Adjusted Thresholds" = sapply(save_tier_thresholds, function(x){x*c}),
+              "Data" = TIERING_DATA_ALL[,.(POL_NUMBER, 
+                                           WRITN_YEAR, 
+                                           GWP, 
+                                           LEVELLED_GWP, 
+                                           predicted_num_losses,
+                                           predicted_claim_size,
+                                           predicted_incurred,
+                                           predicted_LR, 
+                                           actual_LR,
+                                           pred_TIER
+                                           )]))
+}
+
+###### Section: GRAPHICAL FUNCTIONS FOR MODELLING ######
+#Graphical shap values (for categoric variables)
+SHAP_CATEGORIES <- function(model, matrix) {
+  shap_values <- predict(model, matrix, predcontrib = TRUE, approxcontrib = F)
+  shap_DATA <- as.data.table(apply(matrix, 2, function(x){ifelse(is.na(x), NA, ifelse(x == 0, NA, x))}))
+  shap_DATA_temp <- shap_DATA
+  shap_values2 <- as.data.table(shap_values)[,!c("BIAS")] * shap_DATA
+  
+  shap_values_graph <- data.table(factors = colnames(shap_values2), 
+                                  Shap = apply(shap_values2, 2, function(x){mean(x,na.rm=T)}), 
+                                  sd = apply(shap_values2, 2, function(x){sd(x,na.rm=T)}),
+                                  count = apply(shap_values2, 2, function(x){sum(!is.na(x), na.rm=T)}))
+  
+  shap_DATA <- as.data.table(apply(matrix, 2, function(x){ifelse(is.na(x), NA, ifelse(x == 0, 1, NA))}))
+  shap_values2 <- as.data.table(shap_values)[,!c("BIAS")] * shap_DATA
+  
+  shap_values_graph2 <- data.table(factors = colnames(shap_values2))
+  shap_values_graph2$Shap <- sapply(shap_values_graph$factors, function(x){
+    colname <- str_split(x, "[.]")[[1]][1]
+    mean(as.matrix(shap_values2[!is.na(shap_values2[[x]])][which(names(shap_values2) %like% colname)]),na.rm=T)
+  })
+  shap_values_graph2$sd <- sapply(shap_values_graph$factors, function(x){
+    colname <- str_split(x, "[.]")[[1]][1]
+    sd(as.matrix(shap_values2[!is.na(shap_values2[[x]])][which(names(shap_values2) %like% colname)]),na.rm=T)
+  })
+  # shap_values_graph2$sd <- 0
+  
+  shap_values_graph2$count <- 0
+  
+  shap_values_graph <- rbindlist(list(shap_values_graph, shap_values_graph2))[, lapply(.SD, sum, na.rm = TRUE), by = factors]
+  
+  #Remove non categoric values since this graphing doesn't accurately represent them.
+  indexes <- unique((1:length(names(shap_DATA_temp)))*apply(shap_DATA_temp,2,function(x){ifelse(length(unique(x)) > 2,0,1)}))
+  indexes <- indexes[which(indexes != 0)]
+  factors_to_keep <- names(shap_DATA_temp)[indexes]
+  shap_values_graph <- shap_values_graph[factors %in% factors_to_keep]
+  shap_values_graph <- shap_values_graph[factors != "DEVELOPMENT"]
+  
+  #shap_values_graph <- rbind(shap_values_graph, data.table(factors = "BIAS", Shap = mean(as.data.table(shap_values)$BIAS,na.rm=T), sd = sd(as.data.table(shap_values)$BIAS, na.rm=T)))
+  ggplot(shap_values_graph, aes(y=factors, x = Shap)) + 
+    geom_bar(stat="identity") + 
+    geom_errorbar(aes(xmin=Shap-sd, xmax=Shap+sd), width = 0.2) + 
+    geom_text(aes(label = count), hjust = 1, x = Inf)
+}
+INCURRED_SHAP_CATEGORIES <- function(poiss_model, poiss_matrix, gamma_model, gamma_matrix) {
+  shap_values <- predict(poiss_model, poiss_matrix, predcontrib = TRUE, approxcontrib = F)
+  shap_DATA <- as.data.table(apply(poiss_matrix, 2, function(x){ifelse(is.na(x), NA, ifelse(x == 0, NA, x))}))
+  shap_values2 <- as.data.table(shap_values)[,!c("BIAS")] * shap_DATA
+  
+  shap_values_graph <- data.table(factors = colnames(shap_values2), 
+                                  Shap = apply(shap_values2, 2, function(x){mean(x,na.rm=T)}), 
+                                  sd = apply(shap_values2, 2, function(x){sd(x,na.rm=T)}),
+                                  count = apply(shap_values2, 2, function(x){sum(!is.na(x), na.rm=T)}))
+  
+  shap_DATA <- as.data.table(apply(poiss_matrix, 2, function(x){ifelse(is.na(x), NA, ifelse(x == 0, 1, NA))}))
+  shap_values2 <- as.data.table(shap_values)[,!c("BIAS")] * shap_DATA
+  
+  shap_values_graph2 <- data.table(factors = colnames(shap_values2))
+  shap_values_graph2$Shap <- sapply(shap_values_graph$factors, function(x){
+    colname <- str_split(x, "[.]")[[1]][1]
+    mean(as.matrix(shap_values2[!is.na(shap_values2[[x]])][which(names(shap_values2) %like% colname)]),na.rm=T)
+  })
+  # shap_values_graph2$sd <- sapply(shap_values_graph$factors, function(x){
+  #   colname <- str_split(x, "[.]")[[1]][1]
+  #   sd(as.matrix(shap_values2[!is.na(shap_values2[[x]])][which(names(shap_values2) %like% colname)]),na.rm=T)
+  # })
+  shap_values_graph2$sd <- 0
+  shap_values_graph2$count <- 0
+  total_graph <- rbindlist(list(shap_values_graph, shap_values_graph2))[, lapply(.SD, sum, na.rm = TRUE), by = factors]
+  
+  
+  shap_values <- predict(gamma_model, gamma_matrix, predcontrib = TRUE, approxcontrib = F)
+  shap_DATA <- as.data.table(apply(gamma_matrix, 2, function(x){ifelse(is.na(x), NA, ifelse(x == 0, NA, x))}))
+  shap_values2 <- as.data.table(shap_values)[,!c("BIAS")] * shap_DATA
+  
+  shap_values_graph <- data.table(factors = colnames(shap_values2), 
+                                  Shap = apply(shap_values2, 2, function(x){mean(x,na.rm=T)}), 
+                                  sd = apply(shap_values2, 2, function(x){sd(x,na.rm=T)}),
+                                  count = apply(shap_values2, 2, function(x){sum(!is.na(x), na.rm=T)}))
+  
+  shap_DATA <- as.data.table(apply(gamma_matrix, 2, function(x){ifelse(is.na(x), NA, ifelse(x == 0, 1, NA))}))
+  shap_values2 <- as.data.table(shap_values)[,!c("BIAS")] * shap_DATA
+  
+  shap_values_graph2 <- data.table(factors = colnames(shap_values2))
+  shap_values_graph2$Shap <- sapply(shap_values_graph$factors, function(x){
+    colname <- str_split(x, "[.]")[[1]][1]
+    mean(as.matrix(shap_values2[!is.na(shap_values2[[x]])][which(names(shap_values2) %like% colname)]),na.rm=T)
+  })
+  # shap_values_graph2$sd <- sapply(shap_values_graph$factors, function(x){
+  #   colname <- str_split(x, "[.]")[[1]][1]
+  #   sd(as.matrix(shap_values2[!is.na(shap_values2[[x]])][which(names(shap_values2) %like% colname)]),na.rm=T)
+  # })
+  shap_values_graph2$sd <- 0
+  shap_values_graph2$count <- 0
+  shap_values_graph <- rbindlist(list(shap_values_graph, shap_values_graph2))[, lapply(.SD, sum, na.rm = TRUE), by = factors]
+  total_graph <- rbindlist(list(total_graph, shap_values_graph))[, lapply(.SD, sum, na.rm = TRUE), by = factors]
+  shap_values_graph <- total_graph
+  
+  #Remove non categoric values since this graphing doesn't accurately represent them.
+  shap_values_graph <- shap_values_graph[!(factors %in% c("TENURE", "FIN_RISK_SCR", "LOG_NUM_SITES", "LOG_TURNOVER", "LOG_EMPLOYEES", "DEVELOPMENT", "BIAS"))]
+  #shap_values_graph <- rbind(shap_values_graph, data.table(factors = "BIAS", Shap = mean(as.data.table(shap_values)$BIAS,na.rm=T), sd = sd(as.data.table(shap_values)$BIAS, na.rm=T)))
+  ggplot(shap_values_graph, aes(y=factors, x = Shap)) + 
+    geom_bar(stat="identity") + 
+    geom_errorbar(aes(xmin=Shap-sd, xmax=Shap+sd), width = 0.2) + 
+    geom_text(aes(label = count), hjust = 1, x = Inf)
+}
+SHAP_CURVE = function(model, matrix, column){
+  cols = colnames(matrix)[which(colnames(matrix) %like% column)]
+  shap_values <- as.data.table(predict(model, matrix, predcontrib = TRUE, approxcontrib = F))[,..cols]
+  values = as.data.table(matrix)[,..cols]
+  if (!is.null(dim(values)) && dim(values)[2] < 1){
+    stop("Feature not found.")
+  }
+  data = data.table(val = melt(values), shap = melt(shap_values))
+  data = data[,!"shap.variable"]
+  max_num_values = length(unique(data[!is.na(val.value)]$val.value))
+  means = NULL
+  for(col in unique(data$val.variable)){
+    means_temp = data.table(val.value = seq(min(data$val.value,na.rm=T), max(data$val.value,na.rm=T), length.out = 100))
+    means_temp$val.variable = col
+    scale = 1/(means_temp$val.value[2] - means_temp$val.value[1])
+    # Smooth out the line by weighting the average towards points that are closer (using a gaussian function).
+    means_temp$mean_shap = sapply(means_temp$val.value, function(x){
+      sum(data[val.variable == col]$shap.value * 
+            exp(-scale * (data[val.variable == col]$val.value - x)**2), na.rm = T)/
+        sum(exp(-scale * (data[val.variable == col]$val.value - x)**2), na.rm = T)
+    })
+    means_temp$sd = apply(means_temp, 1, function(x){
+      sum(((data[val.variable == col]$shap.value - as.numeric(x[["mean_shap"]]))**2) * 
+            exp(-scale * (data[val.variable == col]$val.value - as.numeric(x[["val.value"]]))**2), na.rm = T)/
+        sum(exp(-scale * (data[val.variable == col]$val.value - as.numeric(x[["val.value"]]))**2), na.rm = T)
+    })
+    means_temp$upper_shap = means_temp$mean_shap + sqrt(means_temp$sd)
+    means_temp$lower_shap = means_temp$mean_shap - sqrt(means_temp$sd)
+    if(is.null(means)){
+      means = means_temp
+    }else {
+      means = rbind(means, means_temp)
+    }
+  }
+  # means = data[,.(mean_shap = mean(shap.value)), by = c("val.variable", "val.value")]
+  # spline_int = as.data.frame(spline(means$val.value, means$mean_shap))
+  g = ggplot() + 
+    geom_point(data = data, aes(x = val.value, y = shap.value), size = 0.1, col = 'blue') +
+    #geom_line(data = spline_int, aes(x = x, y = y), size = 0.1, col = 'red') +
+    geom_line(data = means, aes(x = val.value, y = mean_shap), size = 1, col = 'red') +
+    geom_line(data = means, aes(x = val.value, y = upper_shap), size = 0.6, col = 'red', linetype = "dashed") +
+    geom_line(data = means, aes(x = val.value, y = lower_shap), size = 0.6, col = 'red', linetype = "dashed") +
+    facet_wrap(~ val.variable, ncol = 2, scales = "free") + 
+    ylab("SHAP") + xlab(column)
+  if(max_num_values < 3){
+    g = g + scale_x_continuous(breaks = c(0, 1), label = c("FALSE","TRUE"))
+  }
+  #labs(title = "SHAP Responses", col = "Feature") #+ scale_y_continuous(labels = scales::percent)
+  return(g)
+}
+INCURRED_SHAP_CURVE = function(model_list_freq, model_list_sev, freq_shap_scores = NULL, sev_shap_scores = NULL, column, partial_col = "", multi_plot = TRUE){
+  # The severity model is trained with a target of LOG10(1+avg_claim_size), and therefore this is also the output.
+  # Shap scores multiply the prediction by exp(shap score) with the total prediciton being exp(sum(shap scores))
+  # Therefore the predicted incurred is exp(sum(frequency shap scores)) * 10**(exp(sum(severity shap scores)))
+  # Therefore we can't simply add the shap scores from the two models. Instead we work out the multiplicative factor
+  # to go from a model where the given feature has zero shap score (i.e. no impact on model) to one where it is in the
+  # prediction. We just get the ratio of these values to show the change in prediction due to the factor.
+  
+  # The partial column allows us to look at the partial dependence of factors. Rather than just looking at the response of column
+  # we look at each pair of column and partial_col. The graphs will look the same, except that we will have different
+  # lines for each value in partial_col. Note that partial_col only really makes sense for discrete/categoric variables.
+  
+  # multi_plot = TRUE has the graph plot each value on a different plot. multi_plot = FALSE puts all values on the same graph,
+  # but does not plot the standard deviation (to avoid clutter). This useful for categoric variables.
+  
+  # cols_freq = colnames(model_list_freq[["data"]])[which(colnames(model_list_freq[["data"]]) %like% column)]
+  # cols_sev = colnames(model_list_freq[["data"]])[which(colnames(model_list_freq[["data"]]) %like% column)]
+  cols_freq = model_list_freq$model$feature_names[which(model_list_freq$model$feature_names %like% column)]
+  cols_sev = model_list_sev$model$feature_names[which(model_list_sev$model$feature_names %like% column)]
+  cols = unique(c(cols_freq, cols_sev))
+  if(length(cols) == 0){
+    stop("Invalid column input.")
+  }
+  
+  if(is.null(freq_shap_scores)){
+    shap_values_freq = GENERATE_PREDICTIONS_FROM_MODEL(model_list_freq, model_list_freq$data_list, for_renewal = F, shap_values = T)
+  }else{
+    shap_values_freq = freq_shap_scores
+  }
+  if(is.null(sev_shap_scores)){
+    shap_values_sev = GENERATE_PREDICTIONS_FROM_MODEL(model_list_sev, model_list_freq$data_list, for_renewal = F, shap_values = T)
+  }else{
+    shap_values_sev = sev_shap_scores
+  }
+  
+  # shap_values_freq = as.data.table(predict(model_list_freq[["model"]], model_list_freq[["data"]], predcontrib = TRUE, approxcontrib = F))
+  # sev_data = model_list_freq[["data"]][,which(colnames(model_list_freq[["data"]]) %in% model_list_sev$model$feature_names)]
+  # other_sev_cols = model_list_sev$model$feature_names[which(!(model_list_sev$model$feature_names %in% colnames(model_list_freq[["data"]])))]
+  # if(!is.null(other_sev_cols) & length(other_sev_cols) > 0){
+  #   sev_data[,(other_sev_cols) := NA]
+  # }
+  # return(other_sev_cols)
+  # shap_values_sev = as.data.table(predict(model_list_sev[["model"]], sev_data,
+  #                                         predcontrib = TRUE, approxcontrib = F))
+  
+  base_prediction = exp(mean(shap_values_freq$BIAS)) * 10**(exp(mean(shap_values_sev$BIAS)))
+  
+  shap_values_freq = shap_values_freq[,..cols_freq]
+  
+  shap_values_sev$sum_shap = rowSums(shap_values_sev)
+  #shap_values_sev = as.data.table(apply(shap_values_sev, 1, function(x){x - as.numeric(x[["pred"]])[1]}))
+  
+  
+  #shap_values_sev = shap_values_sev[,!"sum_shap"]
+  cols_sev = c(cols_sev, "sum_shap")
+  shap_values_sev = shap_values_sev[,..cols_sev]
+  
+  
+  
+  values = model_list_freq$data_list[,..column]
+  if(!is.numeric(values[[column]])){
+    values = as.data.table(lapply(values, as.factor))
+    dummies <- dummyVars(as.formula(paste0("~ ", paste0(column, collapse = " + "))), data = values)
+    values <- as.data.table(predict(dummies, newdata = values))
+  }
+  
+  if (is.null(dim(values)) || dim(values)[2] < 1){
+    stop("Feature not found.")
+  }
+  # shap_values_freq[[column]] = rowSums(shap_values_freq, na.rm = T)
+  # shap_values_sev[[column]] = rowSums(shap_values_sev, na.rm = T)
+  for(s_col in names(shap_values_sev)){
+    shap_values_sev[[s_col]] = exp(shap_values_sev[["sum_shap"]]) - exp(shap_values_sev[["sum_shap"]] - shap_values_sev[[s_col]])
+  }
+  shap_values_sev = shap_values_sev[,!"sum_shap"]
+  # cols = c(column)
+
+  # If this feature is not within one of the models, we need to make an empty data.table for it
+  # Otherwise, when we try to assign a new column, an error will occur.
+  if(dim(shap_values_freq)[1] < 1){
+    shap_values_freq = data.table(empty = 0)
+  }
+  if(dim(shap_values_sev)[1] < 1){
+    shap_values_sev = data.table(empty = 0)
+  }
+  
+  shap_values = NULL
+  for(col in cols){
+    # Add in columns that don't exist in the other shap table.
+    # Setting to zero means it won't adjust the prediction.
+    if(!(col %in% cols_freq)){
+      shap_values_freq[[col]] = 0
+    }
+    if(!(col %in% cols_sev)){
+      shap_values_sev[[col]] = 0
+    }
+    
+    if(is.null(shap_values)){
+      shap_values = data.table(v = (exp(shap_values_freq[[col]]) * 
+                                      10**(shap_values_sev[[col]])))
+      names(shap_values) = c(col)
+      #shap_values[[col]] = shap_values[[col]] - min(shap_values[[col]])
+    }else{
+      # shap_values = cbind(shap_values, data.table((col) = (exp(shap_values_freq[[col]]) * 
+      #                            10**(exp(shap_values_sev[[col]])))) - 1)
+      shap_values[[col]] = (exp(shap_values_freq[[col]]) * 
+                              10**(shap_values_sev[[col]]))
+      #shap_values[[col]] = shap_values[[col]] - min(shap_values[[col]])
+      
+    }
+  }
+  
+  data = data.table(val = melt(values), shap = melt(shap_values))
+  data = data[,!"shap.variable"]
+  
+  # names(values) = c("val.value")
+  # data = data.table(values, 
+  #              shap_values)
+  # data$val.variable = column
+  # names(data) = c("val.value", "shap.value", "val.variable")
+  
+  max_num_values = length(unique(data[!is.na(val.value)]$val.value))
+  means = NULL
+  for(col in unique(data$val.variable)){
+    means_temp = data.table(val.value = seq(min(data$val.value,na.rm=T), max(data$val.value,na.rm=T), length.out = 100))
+    means_temp$val.variable = col
+    #scale = 10/(means_temp$val.value[2] - means_temp$val.value[1])
+    #Let the scale be the average non-zero difference between values
+    differences = data[order(val.value)][, .(diff = abs(shift(val.value, 1) - val.value)), by = val.variable]
+    if(length(unique(data[!is.na(val.value)]$val.value)) <= 2)
+      scale = 1000/mean(differences[diff > 0]$diff, na.rm = T)
+    else
+      scale = 2/mean(differences[diff > 0]$diff, na.rm = T)
+    
+    # Smooth out the line by weighting the average towards points that are closer (using a gaussian function).
+    means_temp$mean_shap = sapply(means_temp$val.value, function(x){
+      sum(data[val.variable == col]$shap.value * 
+            exp(-scale * (data[val.variable == col]$val.value - x)**2), na.rm = T)/
+        sum(exp(-scale * (data[val.variable == col]$val.value - x)**2), na.rm = T)
+    })
+    means_temp$sd = apply(means_temp, 1, function(x){
+      sum(((data[val.variable == col]$shap.value - as.numeric(x[["mean_shap"]]))**2) * 
+            exp(-scale * (data[val.variable == col]$val.value - as.numeric(x[["val.value"]]))**2), na.rm = T)/
+        sum(exp(-scale * (data[val.variable == col]$val.value - as.numeric(x[["val.value"]]))**2), na.rm = T)
+    })
+    means_temp$upper_shap = means_temp$mean_shap + sqrt(means_temp$sd)
+    means_temp$lower_shap = means_temp$mean_shap - sqrt(means_temp$sd)
+    if(is.null(means)){
+      means = means_temp
+    }else {
+      means = rbind(means, means_temp)
+    }
+  }
+  
+  # means = data[,.(mean_shap = mean(shap.value)), by = c("val.variable", "val.value")]
+  # spline_int = as.data.frame(spline(means$val.value, means$mean_shap))
+  if(multi_plot | length(unique(data$val.variable)) == 1){
+    g = ggplot() + 
+      geom_point(data = data, aes(x = val.value, y = shap.value), size = 0.1, col = 'red', alpha = 0.4) +
+      #geom_line(data = spline_int, aes(x = x, y = y), size = 0.1, col = 'red') +
+      geom_line(data = means, aes(x = val.value, y = mean_shap), size = 1, col = 'blue') +
+      geom_line(data = means, aes(x = val.value, y = upper_shap), size = 0.8, col = 'blue', linetype = "dashed") +
+      geom_line(data = means, aes(x = val.value, y = lower_shap), size = 0.8, col = 'blue', linetype = "dashed") +
+      facet_wrap(~ val.variable, ncol = 2, scales = "free") + 
+      ylab("Prediction Multiplier") + xlab(column) +
+      ggtitle(paste0("Base Pred: ", round(base_prediction,0)))
+    if(max_num_values < 3){
+      g = g + scale_x_continuous(breaks = c(0, 1), label = c("FALSE","TRUE"))
+    }
+  }
+  else{
+    data[, val.variable := sapply(val.variable, function(x){str_split(x, "[.]")[[1]][2]})]
+    means[, val.variable := sapply(val.variable, function(x){str_split(x, "[.]")[[1]][2]})]
+    # g = ggplot() + 
+    #   geom_point(data = data, aes(x = val.value, y = shap.value, col = val.variable), size = 0.1, alpha = 0.4) +
+    #   geom_line(data = means, aes(x = val.value, y = mean_shap, col = val.variable), size = 1) +
+    #   ylab("Prediction Multiplier") + xlab(column) +
+    #   ggtitle(paste0("Base Pred: ", round(base_prediction,0)))
+    means$label = ifelse(means$mean_shap >= 1, 
+                         paste0("+", round(100*(means$mean_shap - 1), 0), "%", "(", round(100*(sqrt(means$sd)), 0),"%)"), 
+                         paste0(round(100*(means$mean_shap - 1), 0), "%", "(", round(100*(sqrt(means$sd)), 0),"%)")
+    )
+    
+    g = ggplot(means[val.value == 1]) +
+      geom_bar(aes(x = val.variable, y = mean_shap - 1, fill = val.variable), stat = "identity")+
+      geom_errorbar(aes(x = val.variable, ymin = lower_shap -1 , ymax = upper_shap - 1), width = 0)+
+      geom_text(aes(x = val.variable, y = Inf, label = label), hjust = 1, vjust = -0.5) +
+      ylab("Prediction Multiplier") + xlab(column) +
+      coord_flip() +
+      ggtitle(paste0("Base Pred: ", round(base_prediction,0))) +
+      scale_y_continuous(labels = scales::percent) +
+      theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1), 
+            legend.position = "none")
+    
+  }
+  
+  #labs(title = "SHAP Responses", col = "Feature") #+ scale_y_continuous(labels = scales::percent)
+  return(g)
+}
+SAVE_ALL_SHAP_CURVES = function(model_list_freq, model_list_sev, folder, filename){
+  features = unique(sapply(str_split(model_list_freq$model$feature_names,"[.]"), function(x){x[1]}))
+  shap_values_freq = GENERATE_PREDICTIONS_FROM_MODEL(model_list_freq, model_list_freq$data_list, for_renewal = F, shap_values = T)
+  shap_values_sev = GENERATE_PREDICTIONS_FROM_MODEL(model_list_sev, model_list_freq$data_list, for_renewal = F, shap_values = T)
+  for(col in features){
+    s = INCURRED_SHAP_CURVE(model_list_freq, model_list_sev, 
+                            freq_shap_scores = shap_values_freq, 
+                            sev_shap_scores = shap_values_sev, 
+                            column = col,
+                            multi_plot = FALSE)
+    ggsave(paste0(folder,"/SHAPCURVE_", filename, "_",col,".png"), 
+           plot = s,
+           width = 7, height = 7.5)
+    print(paste0("Saved SHAP graph ", col))
+  }
+  print("All SHAP curves saved.")
+}
+VIEW_ALL_SHAP_CURVES = function(model_list_freq, model_list_sev){
+  features = unique(sapply(str_split(model_list_freq$model$feature_names,"[.]"), function(x){x[1]}))
+  shap_values_freq = GENERATE_PREDICTIONS_FROM_MODEL(model_list_freq, model_list_freq$data_list, for_renewal = F, shap_values = T)
+  shap_values_sev = GENERATE_PREDICTIONS_FROM_MODEL(model_list_sev, model_list_freq$data_list, for_renewal = F, shap_values = T)
+  for(col in features){
+    s = INCURRED_SHAP_CURVE(model_list_freq, model_list_sev, 
+                            freq_shap_scores = shap_values_freq, 
+                            sev_shap_scores = shap_values_sev, 
+                            column = col,
+                            multi_plot= FALSE)
+    print(s)
+    print(col)
+  }
+  print("All SHAP curves printed.")
+}
+
+# Graphing predictions against actual. 
+PREDICTION_XY_GRAPH <- function(model, matrix, data){
+  prediction_scale <- ifelse(model$params$objective %like% "gamma", 1, 1)
+  predicted <- predict(model, matrix)
+  results <- data.table(prediction = predicted/prediction_scale, actual = data$target)
+  graph_scale <- 1.1*(1+max(results))
+  ggplot(results) + geom_point(aes(x = 1+actual, y = 1+prediction), size = 0.9, alpha = 0.2) +
+    geom_abline(intercept = 0, slope = 1)+
+    scale_x_continuous(limits=c(1,graph_scale),trans="log10")+
+    scale_y_continuous(limits=c(1,graph_scale),trans="log10")
+}
+PREDICTION_DENSITY_GRAPH <- function(model, matrix, data){
+  prediction_scale <- ifelse(model$params$objective %like% "gamma", 1, 1)
+  predicted <- predict(model, matrix)
+  results <- data.table(label = "Predicted", value = predicted/prediction_scale)
+  results <- rbind(results, data.table(label = "Actual", value = data$target))
+  
+  ggplot(results) +
+    geom_density(aes(x = log10(1+value), colour = label))
+}
+PREDICTION_LR_XY_GRAPH <- function(model_poiss, model_gamma, data){
+  predicted_freq <- GENERATE_PREDICTIONS(model_poiss, data)
+  predicted_sev <- GENERATE_PREDICTIONS(model_gamma, data)
+  results <- data.table(prediction = predicted_freq * predicted_sev, actual = data$INCURRED/data$GWP)
+  graph_scale <- 1.1*(1+max(results))
+  ggplot(results) + geom_point(aes(x = 1+actual, y = 1+prediction), size = 0.9) +
+    geom_abline(intercept = 0, slope = 1)+
+    scale_x_continuous(limits=c(1,graph_scale),trans="log10")+
+    scale_y_continuous(limits=c(1,graph_scale),trans="log10")
+}
+
+# Calculating the normalized RMSE (with options for how to normalize).
+RMSE <- function(model, matrix, obs, pow10 = F){
+  sim <- predict(model, matrix)
+  obs <- as.vector(obs)
+  #sim <- sum(obs) / sum(sim)
+  if(pow10){
+    sim = 10**sim - 1
+    obs = 10**obs - 1
+  }
+  return(sqrt(mean((sim - obs)^2,na.rm=T)))
+}
+NRMSE <- function(model, matrix, obs, norm = "all"){
+  sim <- predict(model, matrix)
+  obs <- as.vector(obs)
+  #sim <- sum(obs) / sum(sim)
+  rmse <- sqrt(mean((sim - obs)^2,na.rm=T))
+  
+  if(norm == "all"){
+    list("sd" = rmse/sd(obs),
+         "mean" = rmse/mean(obs,na.rm=T),
+         "median" = rmse/median(obs,na.rm=T),
+         "maxmin" = rmse/(max(obs) - min(obs)))
+  }
+  else if(norm == "sd"){
+    rmse/sd(obs)
+  }
+  else if(norm == "mean"){
+    rmse/mean(obs,na.rm=T)
+  }
+  else if(norm == "median"){
+    rmse/median(obs,na.rm=T)
+  }
+  else if(norm == "maxmin"){
+    n <- max(obs) - min(obs)
+    rmse/n
+  }
+  
+  else{
+    stop("Norm value not expected.")
+  }
+}
+
+# Save all graphs for a given model and data set:
+# Saves a shap graph, shap categories graph, XY_graph, density_graph & importance bar chart.
+SAVE_MODEL_GRAPHS <- function(filename, folder, model_data_list){
+  try(ggsave(paste0(folder,"/", filename, "_Shap_Categories.png"), 
+         plot = SHAP_CATEGORIES(model_data_list[["model"]], model_data_list[["data"]]),
+         width = 7, height = 7.5))
+  
+      png(paste0(folder,"/", filename, "_Shap_Graphs.png"))
+      xgb.plot.shap(model_data_list[["data"]], model = model_data_list[["model"]],top_n = 15, n_col = 3,plot = TRUE)
+      dev.off()
+      
+  # try(ggsave(paste0(folder,"/", filename, "_Shap_Graphs.png"), 
+  #            plot = xgb.plot.shap(model_data_list[["data"]], model = model_data_list[["model"]],top_n = 15, n_col = 3)$shap_contrib,
+  #            width = 7, height = 7.5))
+  
+  try(ggsave(paste0(folder,"/", filename, "_XY.png"), 
+         plot = PREDICTION_XY_GRAPH(model_data_list[["model"]], model_data_list[["data"]],model_data_list[["data_all"]]),
+         width = 7, height = 7.5))
+  
+  try(ggsave(paste0(folder,"/", filename, "_Density.png"),
+         plot = PREDICTION_DENSITY_GRAPH(model_data_list[["model"]], model_data_list[["data"]],model_data_list[["data_all"]]),
+         width = 7, height = 7.5))
+  
+  # try(ggsave(paste0(folder,"/", filename, "_Importance.png"),
+  #            plot = xgb.plot.importance(xgb.importance(data = model_data_list[["data"]], model = model_data_list[["model"]], 
+  #                                                      feature_names = colnames(model_data_list[["data"]]))),
+  #            width = 7, height = 7.5))
+  # Updating in line with package update
+  try(ggsave(paste0(folder,"/", filename, "_Importance.png"),
+             plot = xgb.ggplot.importance(xgb.importance(model = model_data_list[["model"]], 
+                                                       feature_names = colnames(model_data_list[["data"]]))),
+             width = 7, height = 7.5))
+  print(paste0("Saved all graphs to ", folder))
+}
+
+SAVE_RESULTS_XL = function(LOB, models, backtesting, filepath, version){
+  wb = createWorkbook()
+  
+  # wb = loadWorkbook("INPUTS/INSIGHTS_TEMPLATE.xlsx")
+  
+  overview = data.table("LOB" = LOB,
+                   "DATE_CREATED" = Sys.Date(),
+                   "FREQ_RMSE" = RMSE(models$freq_model$model, 
+                                      models$freq_model$data, 
+                                      models$freq_model$data_all$target),
+                   "SEV_RMSE" = RMSE(models$sev_model$model, 
+                                     models$sev_model$data, 
+                                     models$sev_model$data_all$target,
+                                     pow10 = T))
+  
+  addWorksheet(wb, sheetName = "Results")
+  index = 1
+  writeData(wb, 
+            sheet = "Results",
+            paste0(LOB, " Smart Tiering Model Results"),
+            colNames = F)
+  index = index + 2
+  
+  writeDataTable(wb, 
+                 sheet = "Results",
+                 overview,
+                 startCol = 1,
+                 startRow = index)
+  index = index + 3
+    
+  for(i in 1:length(backtesting)){
+    print(as.data.table(backtesting[[i]]))
+    writeData(wb,
+              sheet= "Results",
+              names(backtesting)[[i]],
+              startCol = 1,
+              startRow = index)
+    index = index + 1
+    writeDataTable(wb, 
+                   sheet = "Results",
+                   as.data.table(backtesting[[i]]),
+                   startCol = 1,
+                   startRow = index,
+                   tableName = paste0("TBL_",str_replace_all(names(backtesting)[[i]], " ", "_")))
+    index = index + dim(as.data.table(backtesting[[i]]))[1] + 2
+  }  
+  
+  addWorksheet(wb, sheetName = "Overview")
+  
+  PASTE_BACKTEST_TABLE(wb, "Overview")
+  
+  saveWorkbook(wb, file = paste0(filepath, "/RMSE_",LOB,"_v",version,".xlsx"), overwrite = TRUE)
+}
+
+PASTE_BACKTEST_TABLE = function(wb, sheetName){
+  writeData(wb,
+            sheet = sheetName,
+            c("Smart","TIER",1,2,3,"","Current","TIER","Tier 1", "Tier 2", "Tier 3", "No Tier"),
+            startCol = 1,
+            startRow = 1)
+  writeData(wb,
+            sheet = sheetName,
+            year(Sys.Date()),
+            startCol = 2,
+            startRow = 1)
+  
+  # Smart
+  writeData(wb,
+            sheet = sheetName,
+            "GWP",
+            startCol = 2,
+            startRow = 2)
+  writeData(wb,
+            sheet = sheetName,
+            "Incurred",
+            startCol = 3,
+            startRow = 2)
+  writeData(wb,
+            sheet = sheetName,
+            "actualLR",
+            startCol = 4,
+            startRow = 2)
+  writeData(wb,
+            sheet = sheetName,
+            "pctGWP",
+            startCol = 5,
+            startRow = 2)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("SUMIFS(TBL_Smart_Yearly[GWP],TBL_Smart_Yearly[pred_TIER],$A3,TBL_Smart_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Smart_Yearly[GWP],TBL_Smart_Yearly[pred_TIER],$A4,TBL_Smart_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Smart_Yearly[GWP],TBL_Smart_Yearly[pred_TIER],$A5,TBL_Smart_Yearly[WRITN_YEAR],\"<=\"&$B$1)"),
+               startCol = 2,
+               startRow = 3)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("SUMIFS(TBL_Smart_Yearly[Incurred],TBL_Smart_Yearly[pred_TIER],$A3,TBL_Smart_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Smart_Yearly[Incurred],TBL_Smart_Yearly[pred_TIER],$A4,TBL_Smart_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Smart_Yearly[Incurred],TBL_Smart_Yearly[pred_TIER],$A5,TBL_Smart_Yearly[WRITN_YEAR],\"<=\"&$B$1)"),
+               startCol = 3,
+               startRow = 3)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("C3/B3",
+                 "C4/B4",
+                 "C5/B5"),
+               startCol = 4,
+               startRow = 3)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("B3/SUM(B3:B5)",
+                 "B4/SUM(B3:B5)",
+                 "B5/SUM(B3:B5)"),
+               startCol = 5,
+               startRow = 3)
+  
+  #Current
+  writeData(wb,
+            sheet = sheetName,
+            "GWP",
+            startCol = 2,
+            startRow = 8)
+  writeData(wb,
+            sheet = sheetName,
+            "Incurred",
+            startCol = 3,
+            startRow = 8)
+  writeData(wb,
+            sheet = sheetName,
+            "actualLR",
+            startCol = 4,
+            startRow = 8)
+  writeData(wb,
+            sheet = sheetName,
+            "pctGWP",
+            startCol = 5,
+            startRow = 8)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("SUMIFS(TBL_Current_Yearly[GWP],TBL_Current_Yearly[GCS_TIER],$A9,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Current_Yearly[GWP],TBL_Current_Yearly[GCS_TIER],$A10,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Current_Yearly[GWP],TBL_Current_Yearly[GCS_TIER],$A11,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Current_Yearly[GWP],TBL_Current_Yearly[GCS_TIER],$A12,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)"),
+               startCol = 2,
+               startRow = 9)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("SUMIFS(TBL_Current_Yearly[Incurred],TBL_Current_Yearly[GCS_TIER],$A9,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Current_Yearly[Incurred],TBL_Current_Yearly[GCS_TIER],$A10,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Current_Yearly[Incurred],TBL_Current_Yearly[GCS_TIER],$A11,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)",
+                 "SUMIFS(TBL_Current_Yearly[Incurred],TBL_Current_Yearly[GCS_TIER],$A12,TBL_Current_Yearly[WRITN_YEAR],\"<=\"&$B$1)"),
+               startCol = 3,
+               startRow = 9)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("C9/B9",
+                 "C10/B10",
+                 "C11/B11",
+                 "C12/B12"),
+               startCol = 4,
+               startRow = 9)
+  writeFormula(wb,
+               sheet = sheetName,
+               c("B9/SUM(B9:B12)",
+                 "B10/SUM(B9:B12)",
+                 "B11/SUM(B9:B12)",
+                 "B12/SUM(B9:B12)"),
+               startCol = 5,
+               startRow = 9)
+  
+}
+
+###### Section: MODEL TRAINING RUN ######
+RUN_MODEL_TRAINING = function(LOB,
+                              both_non_ohe_features, both_ohe_features,
+                              freq_only_non_ohe_features = c(), freq_only_ohe_features = c(),
+                              sev_only_non_ohe_features = c(), sev_only_ohe_features = c(),
+                              version = 1,
+                              tiering_type = "GWP", 
+                              tiering_assignment = c(0.15, 0.7),
+                              year_cutoff = 2015, target_year = 2022,
+                              data_caching = TRUE){
+  # Full process to train freq-sev models to be used in tiering.
+  # To make repeated calls faster, data_caching should be set
+  # to TRUE.
+  # If data_caching is TRUE, then data will not be downloaded
+  # from exadata and the function will instead look for
+  # global variables called account_list_final & clms_list_final. 
+  # Since this download process is very long and this model training
+  # function may need to be repeated multiple times, it is much
+  # faster to cache this data than redownload. If new data is needed,
+  # such as if training a model for a different line, then data_caching
+  # should be set to false for the first run of the new training function.
+  # If data_caching is FALSE, the downloads will still be locally saved
+  # as global variables. 
+  
+  LOB_LIST = list(
+    "A&H" = "Accident and Health",
+    "POW" = "Conventional Power", 
+    "LIAB" = "Corp Liability",
+    "MTR" = "Corp Motor",
+    "PRC" = "Corp Property (Non-Wholesale)",
+    "PRW" = "Corp Property (Wholesale)",
+    "CRI" = "Crime",
+    "CYB" = "Cyber",
+    "ENG" = "Engineering (ex. Power)",
+    "FI" = "Financial Institutions",
+    "CONINT" = "GCS Construction (International)",
+    "CONUK" = "GCS Construction (UK)",
+    "GCSO" = "GCS Other",
+    "LD" = "Latent Defects",
+    "LI" = "Legal Ind",
+    "MUK" = "Marine (UK)",
+    "MWH" = "Marine (Wholesale)",
+    "M&A" = "Mergers and Acquisitions",
+    "ML" = "Mgt Liab",
+    "PI" = "PI",
+    "PRI" = "Property Investors",
+    "REN" = "Renewables",
+    "SUR" = "Surety"
+  )
+  
+  if(is.null(LOB_LIST[[LOB]])){
+    stop(paste0("Invalid input (LOB): ", LOB))
+  }
+  else{
+    LineOfBusiness = LOB_LIST[[LOB]]
+  }
+  
+  # First check whether a version of this model already exists.
+  # Halt if so and request an overwrite.
+  if(exists(TRAINING_OUTPUTS_FILEPATH(LOB, version))){
+    stop(paste0("Model version (", LOB, " v", version, ") already exists."))
+  }
+  
+  # Get premiums data
+  if(!data_caching){
+    inflation = INFLATION_ASSUMPTIONS("INPUTS/INFLATION/Inflation_Assumptions_MB.xlsx", target_year)#inflation_assumptions_filename, target_year)
+    print("(1/10) Inflation assumptions loaded.")
+    
+    # policy_list = GET_PREMIUM_DATA(LOB,
+    #                                LineOfBusiness,
+    #                                inflation,
+    #                                year_cutoff)
+    print("(2/10) Premium data downloaded.")
+    DEBUG_PRINT(policy_list)
+    
+    claims_list = GET_CLAIMS_DATA(LOB,
+                                  LineOfBusiness,
+                                  inflation,
+                                  year_cutoff)
+    print("(3/10) Claims data downloaded.")
+    DEBUG_PRINT(claims_list)
+    
+    policy_list_all = GENERATE_POLICY_LIST(policy_list = policy_list,
+                                           claims_list = claims_list,
+                                           # import_RATE = GET_RATE_DATA(LineOfBusiness),
+                                           hist_megafile = GET_EXPERIAN_DATA())
+    print("(4/10) Policy list generated.")
+    DEBUG_PRINT(policy_list_all)
+    
+    xgb_account_list = GENERATE_ACCOUNT_LIST_USING_FEATURE_LIST(policy_list_all = policy_list_all, 
+                                                                claims_list = claims_list,
+                                                                year_cutoff = year_cutoff,
+                                                                both_non_ohe_features = both_non_ohe_features, 
+                                                                both_ohe_features = both_ohe_features,
+                                                                freq_only_non_ohe_features = freq_only_non_ohe_features, 
+                                                                freq_only_ohe_features = freq_only_ohe_features,
+                                                                sev_only_non_ohe_features = sev_only_non_ohe_features, 
+                                                                sev_only_ohe_features = sev_only_ohe_features
+    )
+    assign("xgb_account_list", xgb_account_list, envir = .GlobalEnv)
+    print("(5/10) Account list generated.")
+    DEBUG_PRINT(xgb_account_list)
+    
+    xgb_claims_account_list = GENERATE_CLAIM_ACCOUNT_LIST(claims_list, xgb_account_list)
+    assign("xgb_claims_account_list", xgb_claims_account_list, envir = .GlobalEnv)
+    print("(6/10) Claim account list generated.")
+    DEBUG_PRINT(xgb_claims_account_list)
+  }
+  else{
+    # data_caching is on, so we look for variables
+    # in the global environment to be used for training data.
+    print("(1/10) Data_caching is on, skipping 1-4.")
+    
+    if(!exists("xgb_account_list")){
+      stop("ERROR: Account list not found.")
+    }
+    print("(5/10) Account list found.")
+    if(!exists("xgb_claims_account_list")){
+      stop("ERROR: Claim account list not found.")
+    }
+    print("(6/10) Claims account list found.")
+  }
+  
+  # Generate the models by CARET tuning.
+  # models = GENERATE_FREQ_SEV_MODELS(
+  #   account_list = xgb_account_list,
+  #   claims_account_list = xgb_claims_account_list,
+  #   both_non_ohe_features = both_non_ohe_features,
+  #   both_ohe_features = both_ohe_features,
+  #   freq_only_non_ohe_features = freq_only_non_ohe_features,
+  #   freq_only_ohe_features = freq_only_ohe_features,
+  #   sev_only_non_ohe_features = sev_only_non_ohe_features,
+  #   sev_only_ohe_features = sev_only_ohe_features
+  # )
+  # models = models
+  
+  # Create a second function to bypass CARET package deprecation
+  models = GENERATE_FREQ_SEV_MODELS_MB(
+    account_list = xgb_account_list,
+    claims_account_list = xgb_claims_account_list,
+    both_non_ohe_features = both_non_ohe_features,
+    both_ohe_features = both_ohe_features,
+    freq_only_non_ohe_features = freq_only_non_ohe_features,
+    freq_only_ohe_features = freq_only_ohe_features,
+    sev_only_non_ohe_features = sev_only_non_ohe_features,
+    sev_only_ohe_features = sev_only_ohe_features
+  )
+  
+  print("(7/10) Models generated.")
+  backtesting = MODEL_BACKTESTING(models$freq_model$data_list, 
+                                  models$freq_model, 
+                                  models$sev_model, 
+                                  yr = year_cutoff:target_year, 
+                                  tiering_type = tiering_type, 
+                                  tiering_assignment = tiering_assignment)
+  backtesting <<- backtesting
+  print("(8/10) Models backtested.")
+  SAVE_TRAINED_MODELS(LOB, models, backtesting[["Pure Thresholds"]], version)
+  print("(9/10) Models and thresholds saved.")
+  GENERATE_AND_SAVE_MODEL_INSIGHTS(LOB, models, version, backtesting)
+  print("(10/10) Insighted generated and saved.")
+  print(paste0("Modelling process complete for v.", version))
+  return(models)
+}
+
+SAVE_TRAINED_MODELS = function(LOB, models, pred_thresholds, version){
+  dir.create(TRAINING_OUTPUTS_FILEPATH(LOB, version), showWarnings = FALSE)
+  saveRDS(models$freq_model, paste0("SCRIPTS/python comparison/Model validation/","/v",version,"/",LOB,"_FREQ_MODEL_LIST.RDS"))
+  saveRDS(models$sev_model, paste0("SCRIPTS/python comparison/Model validation/","/v",version,"/",LOB,"_SEV_MODEL_LIST.RDS"))
+  saveRDS(pred_thresholds, paste0("SCRIPTS/python comparison/Model validation/","/v",version,"/",LOB,"_Prediction_Thresholds.RDS"))
+  
+  # Also save down models using xgb.save, to ensure future-proofness of package
+  xgb.save(models$freq_model$model, paste0("SCRIPTS/python comparison/Model validation/","/v",version,"/",LOB,"_FREQ_MODEL.json"))
+  xgb.save(models$sev_model$model, paste0("SCRIPTS/python comparison/Model validation/","/v",version,"/",LOB,"_SEV_MODEL.json"))
+                    }
+
+###### Section: GENERATE INSIGHTS ######
+# Validate and test the model and output the graphical insights from this model.
+GENERATE_AND_SAVE_MODEL_INSIGHTS = function(LOB, models, version, backtesting){
+  dir.create(file.path(TRAINING_OUTPUTS_FILEPATH(LOB, version),"INSIGHTS"), showWarnings = FALSE)
+  dir.create(file.path(TRAINING_OUTPUTS_FILEPATH(LOB, version),"INSIGHTS/SHAP_CURVES"), showWarnings = FALSE)
+  filepath = paste0("SCRIPTS/python comparison/Model validation/", "/",paste0("v", version),"/INSIGHTS")
+  SAVE_ALL_SHAP_CURVES(models$freq_model, models$sev_model, paste0(filepath,"/SHAP_CURVES"), LOB)
+  print("Shap curves saved.")
+  SAVE_MODEL_GRAPHS(paste0("FREQ_",LOB), filepath, models$freq_model)
+  print("Frequency graphs saved.")
+  SAVE_MODEL_GRAPHS(paste0("SEV_",LOB), filepath, models$sev_model)
+  print("Severity graphs saved.")
+  try(ggsave(paste0(filepath,"/", LOB, "_SHAP_INCURRED.png"), 
+         plot = INCURRED_SHAP_CATEGORIES(models$freq_model[["model"]], 
+                                         models$freq_model[["data"]],
+                                         models$sev_model[["model"]],
+                                         models$sev_model[["data"]]),
+         width = 7, height = 7.5))
+  print("Incurred graphs saved.")
+  SAVE_RESULTS_XL(LOB, models, backtesting, filepath, version)
+  print("Results XL generated.")
+  print("All insights saved.")
+}
+
+###### Section: PARTIAL PLOT ######
+# Custom function to graph the partial plot between two values.
+# features = unique(sapply(str_split(freq_model_list$model$feature_names,"[.]"), function(x){x[1]}))
+# shap_values_freq = GENERATE_PREDICTIONS_FROM_MODEL(freq_model_list, freq_model_list$data_list, for_renewal = F, shap_values = T)
+# shap_values_sev = GENERATE_PREDICTIONS_FROM_MODEL(sev_model_list, sev_model_list$data_list, for_renewal = F, shap_values = T)
+# 
+# PARTIAL_SHAP_PLOT = function(model_list_freq, model_list_sev, freq_shap_scores = NULL, sev_shap_scores = NULL, col_x, col_y){
+#   # The severity model is trained with a target of LOG10(1+avg_claim_size), and therefore this is also the output.
+#   # Shap scores multiply the prediction by exp(shap score) with the total prediciton being exp(sum(shap scores))
+#   # Therefore the predicted incurred is exp(sum(frequency shap scores)) * 10**(exp(sum(severity shap scores)))
+#   # Therefore we can't simply add the shap scores from the two models. Instead we work out the multiplicative factor
+#   # to go from a model where the given feature has zero shap score (i.e. no impact on model) to one where it is in the
+#   # prediction. We just get the ratio of these values to show the change in prediction due to the factor.
+#   
+#   # The partial column allows us to look at the partial dependence of factors. Rather than just looking at the response of column
+#   # we look at each pair of column and partial_col. The graphs will look the same, except that we will have different
+#   # lines for each value in partial_col. Note that partial_col only really makes sense for discrete/categoric variables.
+#   
+#   # multi_plot = TRUE has the graph plot each value on a different plot. multi_plot = FALSE puts all values on the same graph,
+#   # but does not plot the standard deviation (to avoid clutter). This useful for categoric variables.
+#   
+#   x_cols_freq = model_list_freq$model$feature_names[which(model_list_freq$model$feature_names %like% col_x)]
+#   x_cols_sev = model_list_sev$model$feature_names[which(model_list_sev$model$feature_names %like% col_x)]
+#   x_cols = unique(c(x_cols_freq, x_cols_sev))
+#   if(length(x_cols) == 0){
+#     stop("Invalid column input.")
+#   }
+#   y_cols_freq = model_list_freq$model$feature_names[which(model_list_freq$model$feature_names %like% col_y)]
+#   y_cols_sev = model_list_sev$model$feature_names[which(model_list_sev$model$feature_names %like% col_y)]
+#   y_cols = unique(c(y_cols_freq, y_cols_sev))
+#   if(length(y_cols) == 0){
+#     stop("Invalid column input.")
+#   }
+#   
+#   
+#   if(is.null(freq_shap_scores)){
+#     shap_values_freq = GENERATE_PREDICTIONS_FROM_MODEL(model_list_freq, model_list_freq$data_list, for_renewal = F, shap_values = T)
+#   }else{
+#     shap_values_freq = freq_shap_scores
+#   }
+#   if(is.null(sev_shap_scores)){
+#     shap_values_sev = GENERATE_PREDICTIONS_FROM_MODEL(model_list_sev, model_list_freq$data_list, for_renewal = F, shap_values = T)
+#   }else{
+#     shap_values_sev = sev_shap_scores
+#   }
+#   
+#   base_prediction = exp(mean(shap_values_freq$BIAS)) * 10**(exp(mean(shap_values_sev$BIAS)))
+#   
+#   cols_freq = unique(x_cols_freq, y_cols_freq)
+#   shap_values_freq = shap_values_freq[,..cols_freq]
+#   
+#   shap_values_sev$sum_shap = rowSums(shap_values_sev)
+#   
+#   cols_freq = unique(x_cols_sev, y_cols_sev, "sum_shap")
+#   shap_values_sev = shap_values_sev[,..cols_sev]
+#   
+#   c_cols = c(col_x, col_y)
+#   values = model_list_freq$data_list[,..c_cols]
+#   # if(!is.numeric(values[[column]])){
+#   #   values = as.data.table(lapply(values, as.factor))
+#   #   dummies <- dummyVars(as.formula(paste0("~ ", paste0(column, collapse = " + "))), data = values)
+#   #   values <- as.data.table(predict(dummies, newdata = values))
+#   # }
+#   ifelse(x_cols)
+#   if (is.null(dim(values)) || dim(values)[2] < 1){
+#     stop("Feature not found.")
+#   }
+#   # shap_values_freq[[column]] = rowSums(shap_values_freq, na.rm = T)
+#   # shap_values_sev[[column]] = rowSums(shap_values_sev, na.rm = T)
+#   for(s_col in names(shap_values_sev)){
+#     shap_values_sev[[s_col]] = exp(shap_values_sev[["sum_shap"]]) - exp(shap_values_sev[["sum_shap"]] - shap_values_sev[[s_col]])
+#   }
+#   shap_values_sev = shap_values_sev[,!"sum_shap"]
+#   # cols = c(column)
+#   
+#   # If this feature is not within one of the models, we need to make an empty data.table for it
+#   # Otherwise, when we try to assign a new column, an error will occur.
+#   if(dim(shap_values_freq)[1] < 1){
+#     shap_values_freq = data.table(empty = 0)
+#   }
+#   if(dim(shap_values_sev)[1] < 1){
+#     shap_values_sev = data.table(empty = 0)
+#   }
+#   
+#   shap_values = NULL
+#   for(col in cols){
+#     # Add in columns that don't exist in the other shap table.
+#     # Setting to zero means it won't adjust the prediction.
+#     if(!(col %in% cols_freq)){
+#       shap_values_freq[[col]] = 0
+#     }
+#     if(!(col %in% cols_sev)){
+#       shap_values_sev[[col]] = 0
+#     }
+#     
+#     if(is.null(shap_values)){
+#       shap_values = data.table(v = (exp(shap_values_freq[[col]]) * 
+#                                       10**(shap_values_sev[[col]])))
+#       names(shap_values) = c(col)
+#       #shap_values[[col]] = shap_values[[col]] - min(shap_values[[col]])
+#     }else{
+#       # shap_values = cbind(shap_values, data.table((col) = (exp(shap_values_freq[[col]]) * 
+#       #                            10**(exp(shap_values_sev[[col]])))) - 1)
+#       shap_values[[col]] = (exp(shap_values_freq[[col]]) * 
+#                               10**(shap_values_sev[[col]]))
+#       #shap_values[[col]] = shap_values[[col]] - min(shap_values[[col]])
+#       
+#     }
+#   }
+#   
+#   data = data.table(val = melt(values), shap = melt(shap_values))
+#   data = data[,!"shap.variable"]
+#   
+#   # names(values) = c("val.value")
+#   # data = data.table(values, 
+#   #              shap_values)
+#   # data$val.variable = column
+#   # names(data) = c("val.value", "shap.value", "val.variable")
+#   
+#   max_num_values = length(unique(data[!is.na(val.value)]$val.value))
+#   means = NULL
+#   for(col in unique(data$val.variable)){
+#     means_temp = data.table(val.value = seq(min(data$val.value,na.rm=T), max(data$val.value,na.rm=T), length.out = 100))
+#     means_temp$val.variable = col
+#     #scale = 10/(means_temp$val.value[2] - means_temp$val.value[1])
+#     #Let the scale be the average non-zero difference between values
+#     differences = data[order(val.value)][, .(diff = abs(shift(val.value, 1) - val.value)), by = val.variable]
+#     if(length(unique(data[!is.na(val.value)]$val.value)) <= 2)
+#       scale = 1000/mean(differences[diff > 0]$diff, na.rm = T)
+#     else
+#       scale = 2/mean(differences[diff > 0]$diff, na.rm = T)
+#     
+#     # Smooth out the line by weighting the average towards points that are closer (using a gaussian function).
+#     means_temp$mean_shap = sapply(means_temp$val.value, function(x){
+#       sum(data[val.variable == col]$shap.value * 
+#             exp(-scale * (data[val.variable == col]$val.value - x)**2), na.rm = T)/
+#         sum(exp(-scale * (data[val.variable == col]$val.value - x)**2), na.rm = T)
+#     })
+#     means_temp$sd = apply(means_temp, 1, function(x){
+#       sum(((data[val.variable == col]$shap.value - as.numeric(x[["mean_shap"]]))**2) * 
+#             exp(-scale * (data[val.variable == col]$val.value - as.numeric(x[["val.value"]]))**2), na.rm = T)/
+#         sum(exp(-scale * (data[val.variable == col]$val.value - as.numeric(x[["val.value"]]))**2), na.rm = T)
+#     })
+#     means_temp$upper_shap = means_temp$mean_shap + sqrt(means_temp$sd)
+#     means_temp$lower_shap = means_temp$mean_shap - sqrt(means_temp$sd)
+#     if(is.null(means)){
+#       means = means_temp
+#     }else {
+#       means = rbind(means, means_temp)
+#     }
+#   }
+#   
+#   # means = data[,.(mean_shap = mean(shap.value)), by = c("val.variable", "val.value")]
+#   # spline_int = as.data.frame(spline(means$val.value, means$mean_shap))
+#   if(multi_plot | length(unique(data$val.variable)) == 1){
+#     g = ggplot() + 
+#       geom_point(data = data, aes(x = val.value, y = shap.value), size = 0.1, col = 'red', alpha = 0.4) +
+#       #geom_line(data = spline_int, aes(x = x, y = y), size = 0.1, col = 'red') +
+#       geom_line(data = means, aes(x = val.value, y = mean_shap), size = 1, col = 'blue') +
+#       geom_line(data = means, aes(x = val.value, y = upper_shap), size = 0.8, col = 'blue', linetype = "dashed") +
+#       geom_line(data = means, aes(x = val.value, y = lower_shap), size = 0.8, col = 'blue', linetype = "dashed") +
+#       facet_wrap(~ val.variable, ncol = 2, scales = "free") + 
+#       ylab("Prediction Multiplier") + xlab(column) +
+#       ggtitle(paste0("Base Pred: ", round(base_prediction,0)))
+#     if(max_num_values < 3){
+#       g = g + scale_x_continuous(breaks = c(0, 1), label = c("FALSE","TRUE"))
+#     }
+#   }
+#   else{
+#     data[, val.variable := sapply(val.variable, function(x){str_split(x, "[.]")[[1]][2]})]
+#     means[, val.variable := sapply(val.variable, function(x){str_split(x, "[.]")[[1]][2]})]
+#     # g = ggplot() + 
+#     #   geom_point(data = data, aes(x = val.value, y = shap.value, col = val.variable), size = 0.1, alpha = 0.4) +
+#     #   geom_line(data = means, aes(x = val.value, y = mean_shap, col = val.variable), size = 1) +
+#     #   ylab("Prediction Multiplier") + xlab(column) +
+#     #   ggtitle(paste0("Base Pred: ", round(base_prediction,0)))
+#     means$label = ifelse(means$mean_shap >= 1, 
+#                          paste0("+", round(100*(means$mean_shap - 1), 0), "%", "(", round(100*(sqrt(means$sd)), 0),"%)"), 
+#                          paste0(round(100*(means$mean_shap - 1), 0), "%", "(", round(100*(sqrt(means$sd)), 0),"%)")
+#     )
+#     
+#     g = ggplot(means[val.value == 1]) +
+#       geom_bar(aes(x = val.variable, y = mean_shap - 1, fill = val.variable), stat = "identity")+
+#       geom_errorbar(aes(x = val.variable, ymin = lower_shap -1 , ymax = upper_shap - 1), width = 0)+
+#       geom_text(aes(x = val.variable, y = Inf, label = label), hjust = 1, vjust = -0.5) +
+#       ylab("Prediction Multiplier") + xlab(column) +
+#       coord_flip() +
+#       ggtitle(paste0("Base Pred: ", round(base_prediction,0))) +
+#       scale_y_continuous(labels = scales::percent) +
+#       theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust=1), 
+#             legend.position = "none")
+#     
+#   }
+#   
+#   #labs(title = "SHAP Responses", col = "Feature") #+ scale_y_continuous(labels = scales::percent)
+#   return(g)
+# }
+# PARTIAL_SHAP_PLOT(freq_model_list, 
+#                   sev_model_list, 
+#                   shap_values_freq, 
+#                   shap_values_sev,
+#                   col_x = "LOG_GWP",
+#                   col_y = "DEVELOPMENT")
