@@ -1,752 +1,2128 @@
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.metrics import mean_squared_error, mean_absolute_error, make_scorer, mean_poisson_deviance
-import xgboost as xgb
-from typing import List, Dict, Tuple, Any, Optional
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import joblib
-import warnings
-from datetime import datetime
+###############################################################################
+## Project:        Automated Tiering Functions
+## Date:           16/11/2021
+## Author(s):      Guy Hughes
+## Description:    A generic script with functions for the tiering process.
+##                  This contains only functions that are used in both the
+##                  monthly tiering process and training models. There
+##                  are other scripts (TIERING_PROCESS_FUNCTIONS.R & 
+##                  TIERING_MODEL_FUNCTIONS.R) which contain the 
+##                  functions required only for the monthly process and the
+##                  model training respectively.
+###############################################################################
 
-try:
-    # scikit-optimize Gaussian Process Bayesian optimization - REQUIRED dependency
-    from skopt import gp_minimize                                 # ← GP Bayesian optimization
-    from skopt.space import Real, Integer                         # ← skopt parameter spaces  
-    from skopt.utils import use_named_args                        # ← skopt utilities
-except ImportError as e:
-    raise ImportError(
-        "scikit-optimize is required for this frequency model. "
-        "Install with: pip install scikit-optimize"
-    ) from e
+###### Section: LIBRARIES ######
+libraries = c("odbc", "maditr", "data.table", "haven", 
+              "readxl", "stringr", "caret", "xgboost",
+              "Matrix", "gbm", "e1071", "vtreat",
+              "ggplot2", "zoo", "lubridate", "Ckmeans.1d.dp",
+              "iml", "openxlsx", "pdp", "keyring")
 
-warnings.filterwarnings('ignore')
+invisible(lapply(libraries, function(x) {
+  if (!require(x, character.only=T)) 
+  {install.packages(x, dependencies = T);require(x)}
+}))
 
+###### Section: VARIABLE DICTIONARY ######
+# The variables in these functions keep consistent names:
+#   LOB               - Line of business, short form. e.g. PRI, PRC
+#   LineOfBusiness    - Line of business, long form. e.g. Corporate Property (Non-Wholesale).
+#                         Must be same format as Qlik CL_LOB_5.
 
-def neg_poisson_deviance_scorer(y_true, y_pred):
-    """Sklearn scorer for negative Poisson deviance (higher is better)
-    Uses sklearn's built-in mean_poisson_deviance for better reliability and consistency"""
-    return -mean_poisson_deviance(y_true, y_pred)
+###### Section: CONNECTIONS ######
+#Connect to Oracle
+# Temporarily store password off screen, then log on to oracle
+GET_CONNECTION = function(override = F){
+  if(override){
+    rm(con, envir = .GlobalEnv)
+  }
+  
+  if(!exists("con")){
+    # Check for a connection to oracle. If it doesn't exist
+    # Ask the user to enter a password.
+    key_set("Password") ; options(my_password = key_get("Password")) 
+    con = dbConnect(drv = odbc::odbc(), dsn = "Oracle_Data", 
+                      pwd = options("my_password")$my_password)
+    assign("con", con, envir = .GlobalEnv)
+    print("Connection to Oracle created.")
+  }
+  else if(is.null(con)){
+    key_set("Password") ; options(my_password = key_get("Password")) 
+    con = dbConnect(drv = odbc::odbc(), dsn = "Oracle_Data", 
+                      pwd = options("my_password")$my_password)
+    assign("con", con, envir = .GlobalEnv)
+    print("Connection to Oracle created.")
+  }
+  return(con)
+}
 
+###### Section: INFLATION ASSUMPTIONS ######
+# INFLATION ASSUMPTIONS
+# For this script, all_lobs, we need different on-levelling assumptions for different LoBs. 
+# We pull this in from a spreadsheet where we can keep these values separate from this code.
+inflation_assumptions_filename = "INPUTS/INFLATION/Inflation_Assumptions.xlsx"
+INFLATION_ASSUMPTIONS = function(filename, target_year){
+  rate_changes <- as.data.table(read.xlsx(filename, sheet = "Rate_Changes", colNames = TRUE))
+  rate_changes <- as.data.table(lapply(rate_changes, function(x){ifelse(is.na(x), 0, x)}))
+  rate_changes <- melt(rate_changes, id.vars = "LoB")
+  names(rate_changes) <- c("Line", "WRITN_YEAR", "rate_change")
+  rate_changes$WRITN_YEAR<- as.numeric(as.character(rate_changes$WRITN_YEAR))
+  rate_changes$rate_change <- as.numeric(rate_changes$rate_change)
+  rate_changes <- rate_changes[WRITN_YEAR <= target_year]
+  rate_changes <- rate_changes[order(-WRITN_YEAR)][,rate_change_multiplier := cumprod(1 + rate_change)/(1 + rate_change), by = Line]
+  rate_changes <- rate_changes[order(WRITN_YEAR)][order(Line)]
+  
+  exposure_inflation <- as.data.table(read.xlsx(filename, sheet = "Exposure_Inflation", colNames = TRUE))
+  exposure_inflation <- as.data.table(lapply(exposure_inflation, function(x){ifelse(is.na(x), 0, x)}))
+  exposure_inflation <- melt(exposure_inflation, id.vars = "LoB")
+  names(exposure_inflation) <- c("Line", "WRITN_YEAR", "exposure_inflation")
+  exposure_inflation$WRITN_YEAR<- as.numeric(as.character(exposure_inflation$WRITN_YEAR))
+  exposure_inflation$exposure_inflation <- as.numeric(exposure_inflation$exposure_inflation)
+  exposure_inflation <- exposure_inflation[WRITN_YEAR <= target_year]
+  exposure_inflation <- exposure_inflation[order(-WRITN_YEAR)][,exposure_multiplier := cumprod(1 + exposure_inflation)/(1 + exposure_inflation), by = Line]
+  exposure_inflation <- exposure_inflation[order(WRITN_YEAR)][order(Line)]
+  
+  claims_inflations <- as.data.table(read.xlsx(filename, sheet = "Claims_Inflations", colNames = TRUE))
+  claims_inflations <- as.data.table(lapply(claims_inflations, function(x){ifelse(is.na(x), 0, x)}))
+  claims_inflations <- melt(claims_inflations, id.vars = "LoB")
+  names(claims_inflations) <- c("Line", "WRITN_YEAR", "claim_inflation")
+  claims_inflations$WRITN_YEAR<- as.numeric(as.character(claims_inflations$WRITN_YEAR))
+  claims_inflations$claim_inflation <- as.numeric(claims_inflations$claim_inflation)
+  claims_inflations <- claims_inflations[WRITN_YEAR <= target_year + 1]
+  claims_inflations <- claims_inflations[order(-WRITN_YEAR)][,claims_multiplier := cumprod(1 + claim_inflation)/(1 + claim_inflation), by = Line]
+  claims_inflations <- claims_inflations[order(WRITN_YEAR)][order(Line)]
+  
+  on_levelling_multipliers <- merge(rate_changes, exposure_inflation, by = c("Line", "WRITN_YEAR"), all = T)
+  on_levelling_multipliers$prem_multiplier = on_levelling_multipliers$rate_change_multiplier * on_levelling_multipliers$exposure_multiplier
+  on_levelling_multipliers <- merge(on_levelling_multipliers, claims_inflations, by = c("Line", "WRITN_YEAR"), all = T)
+  on_levelling_multipliers$LR_multiplier <- on_levelling_multipliers$claims_multiplier / on_levelling_multipliers$prem_multiplier
+  on_levelling_multipliers <- on_levelling_multipliers[WRITN_YEAR <= target_year]
+  return(on_levelling_multipliers)
+}
 
-# Create sklearn scorer using built-in mean_poisson_deviance
-# sklearn's implementation is more robust and handles edge cases better
-try:
-    # Try to use sklearn's built-in scorer string first
-    from sklearn.metrics import get_scorer
-    poisson_scorer = get_scorer('neg_mean_poisson_deviance')
-    print("Using sklearn's built-in 'neg_mean_poisson_deviance' scorer")
-except (ValueError, KeyError):
-    # Fall back to custom scorer if built-in doesn't exist
-    poisson_scorer = make_scorer(neg_poisson_deviance_scorer, greater_is_better=True)
-    print("Using custom negative Poisson deviance scorer")
+###### Section: PARAMETERS & MAPPING FUNCTIONS ######
+year_cutoff <- 2015
 
+#Standardization contains a mapping of substrings that need to be replaced in the insured name (to keep consistency of mapping). It replaces
+# punctuation and common words in company names (which are not consistently included, such as LTD and INC)
+# Consider the removal of "AND 1 OTHERS" and "AND SUBSIDIARY COMPANIES".
+standardization <- data.table(search = c("\r", "\n", "&", "[[:punct:]]", " LIMITED", " LTD", " PLC", " LLC", " INC", "\\s+"), 
+                              replacement = c("", "", "AND", "",  " ", " ", " ", " ", " ", " "))
 
-class FeatureFilter(BaseEstimator, TransformerMixin):
-    """Custom sklearn transformer for feature filtering"""
+STANDARDIZE_INSURED <- function(insured){
+  insd = str_replace_all(insured,"[^[:graph:]]", " ") 
+  insd <- toupper(insd)
+  for(i in 1:dim(standardization)[1]){
+    insd <- str_replace_all(insd, standardization[i,search], standardization[i,replacement])
+  }
+  insd <- str_trim(insd)
+  return(insd)
+}
+
+STANDARDIZE_POL_NUMBER <- function(pol_number){
+  pol_number %>% 
+    str_replace_all("\\s+", "") %>% 
+    str_replace_all("CP[0-9][0-9]", "CPXX")
+    #str_replace_all("[^0-9]", "")
+}
+
+CALC_MODE <- function(v) {
+  uniqv <- unique(v)
+  uniqv <- uniqv[!is.na(uniqv)]
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+major_broker_list <- c("AON","GALLAGHERS", "LOCKTON", "MARSH", "WILLIS")
+BROKER_BAND <- function(BROKER){
+  for(brokers in major_broker_list){
+    b <- ifelse(BROKER %like% brokers, brokers, BROKER)
+  }
+  
+  # as.factor(ifelse(is.na(b), NA,
+  #        ifelse(b %in% major_broker_list, paste0("A. ", paste0(major_broker_list,collapse=", ")), "B. OTHER BROKER")))
+  as.factor(ifelse(is.na(b), NA,
+                   ifelse(b %in% major_broker_list, b, "OTHER BROKER")))
+}
+
+###### Section: FEATURE FUNCTIONS ######
+GET_HIST_VALUE <- function(data_total, 
+                           data_for_summary, 
+                           summarizeBy = c("INSD_NM"),
+                           column_to_summarize, 
+                           sumval = F, 
+                           numberYears = 3, 
+                           includeCurrentYear = FALSE){
+  # Returns a column for the given data, of the numberYears-year historical sum (sumval=T) or count (sumval=F)
+  # for a given column (column_to_summarize). This will count up to that many years, so for historical LR it will 
+  # look for up to 3 years (but will take 2 or 1 years if fewer than 3 years experience is found).
+  # Only returns NA for values where all previous years, within numberYears, are NA.
+  # If includeCurrentYear == TRUE, then one of the numberYears will be the current year. Therefore numberYears = 3
+  # with includeCurrentYear = TRUE, would look at the current year, previous year, and year before that.
+  # SummarizeBy determines the factor which the data is summarizedBy, along with WRITN_YEAR. If it is
+  # policy number, then we will identify the numberYears historical sum of column_to_summarize for each
+  # policy number.
+  cols <- c(summarizeBy,"WRITN_YEAR", column_to_summarize)
+  if(sumval) {
+    year_summary <- data_for_summary[,..cols][,.(yearval = sum(.SD,na.rm=T)), by = c(summarizeBy, "WRITN_YEAR")]
+    #year_summary[["SUMMARY"]] <- year_summary[[summarizeBy]]
+  }
+  else{
+    year_summary <- data_for_summary[,..cols][,.(yearval = .N), by = c(summarizeBy, "WRITN_YEAR")]
+    #year_summary[["SUMMARY"]] <- year_summary[[summarizeBy]]
+  }
+  data_list <- copy(data_total)
+  #data_list[["SUMMARY"]] <- data_list[[summarizeBy]]
+  numberColsBefore <- 1+dim(data_list)[2]
+  currentYearMod <- 0
+  if(includeCurrentYear) currentYearMod <- -1
+  
+  if(numberYears > 0){
+    summary_cols <- c(summarizeBy, "WRITN_YEAR", "yearval")
+    year_summary$WRITN_YEAR <- year_summary$WRITN_YEAR + currentYearMod
+    for(i in (currentYearMod + 1:numberYears)){
+      year_summary$WRITN_YEAR <- year_summary$WRITN_YEAR + 1
+      # Use a data.table in-place merge (join) to preserve order.
+      setDT(data_list)[year_summary, on = c(summarizeBy, "WRITN_YEAR"), yearval := i.yearval][]
+      # data_list <- merge(data_list, 
+      #                    year_summary[,..summary_cols], 
+      #                    by = c(summarizeBy, "WRITN_YEAR"), 
+      #                    all.x=T, all.y=F)
+      data_list[[paste0("yearval",i)]] <- data_list$yearval
+      data_list <- data_list[,!"yearval"]
+    }
     
-    def __init__(self, min_sample_ratio=0.01, min_samples=50):
-        self.min_sample_ratio = min_sample_ratio
-        self.min_samples = min_samples
-        self.features_to_keep_ = None
+    new_data <- rowSums(data_list[,numberColsBefore:dim(data_list)[2]], na.rm=T)
     
-    def fit(self, X, y=None):
-        """Learn which features to keep based on minimum samples requirement"""
-        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        
-        min_required = max(self.min_samples, len(X_df) * self.min_sample_ratio)
-        self.features_to_keep_ = X_df.apply(lambda x: x.gt(0).sum() >= min_required, axis=0)
-        
-        filtered_count = len(X_df.columns) - self.features_to_keep_.sum()
-        if filtered_count > 0:
-            print(f"FeatureFilter: Will filter out {filtered_count} noisy features")
-            
-        return self
+    new_data <- ifelse(rowSums(!is.na(data_list[,numberColsBefore:dim(data_list)[2]]), na.rm=T) > 0, new_data, NA)
+    #new_data <- rowSums(data_list[,.(year1,year2,year3)], na.rm=T)
+    #data_list <- data_list[,!c("year1","year2","year3")]
+    return(new_data)
+  }
+  else stop("NumberYears must be greater than zero.")
+}
+
+FILL_NA <- function(data_input, 
+                    summarizeBy = c("INSD_NM"), 
+                    exceptions = c()){
+  data_set <- data_input
+  data_cols <- names(data_set)
+  for(except in exceptions){
+    if(!(except %in% data_cols)) next
+    data_set[[except]] <- ifelse(is.na(data_set[[except]]), -Inf, data_set[[except]])
+  }
+  data_set <- data_set[, lapply(.SD, function(x){na.locf(na.locf(x,na.rm=FALSE),na.rm=FALSE, fromLast=TRUE)}), 
+                       by = summarizeBy]
+  for(except in exceptions){
+    if(!(except %in% data_cols)) next
+    data_set[[except]] <- ifelse(is.infinite(data_set[[except]]), NA, data_set[[except]])
+  }
+  data_set
+}
+
+###### Section: POLICY DATA ######
+GET_PREMIUM_DATA = function(LOB, LineOfBusiness, i_inflation, year_cutoff){
+  # premium_query_txt = paste0("SELECT * FROM GCS_BI.PRIC_CL_GWP
+  #                            WHERE CL_LOB_1 = 'GCS' AND CL_LOB_5 = ?;")
+  premium_query_txt = paste0("SELECT CL_LOB_5, CUST_ACCT_NUM, INSD_NM, WRITN_YEAR, 
+                             TRANSACTION_DATE, LEVEL_2_FEATURE_GROUP_DESC, 
+                             GWP, POL_PERIOD_START, POL_PERIOD_END,
+                             GCS_TIER, COMM, RNL_MONTH, DOMICILE_GRP_2,
+                             DIRECT_OR_RI, BROKERALL_CD, EXP_FIN_RISK_SCORE,
+                             EXP_LEGAL_STATUS, INCEP_DATE, RNL_DATE,
+                             AGENCY_REF, POLICY_OUTCOME, UNDERWRITER,
+                             GCS_SEGMENT, GCS_SUB_SEGMENT, POLARIS_NAME, POLARIS_TRADE_CD_CURR, LOB_SUB_GROUP_1,
+                             LOB_SUB_GROUP_2, LOB_SUB_GROUP_3,
+                             SOURCE_SYSTEM_DESC, LENGTH_OF_RELATIONSHIP
+                             FROM GCS_BI.PRIC_CL_GWP WHERE CL_LOB_1 = 'GCS' AND CL_LOB_5 = ? 
+                             AND WRITN_YEAR >= ?;")
+
+  premium_inputs = list(LineOfBusiness, year_cutoff)
+  sql_query = dbSendQuery(con, premium_query_txt)
+  dbBind(sql_query, premium_inputs)
+  import_GWP = as.data.table(dbFetch(sql_query))
+  dbClearResult(sql_query)
+  
+  import_GWP$POL_NUMBER <- import_GWP$CUST_ACCT_NUM
+  import_GWP[, CUST_ACCT_NUM := STANDARDIZE_POL_NUMBER(CUST_ACCT_NUM)]
+  import_GWP$INSURED <- import_GWP$INSD_NM
+  import_GWP[, INSD_NM := STANDARDIZE_INSURED(INSD_NM)]
+  
+  import_GWP[, TRANSACTION_DATE := as.Date(import_GWP$TRANSACTION_DATE)]
+  
+  import_GWP <- import_GWP[WRITN_YEAR >= year_cutoff]
+  import_GWP <- merge(import_GWP, i_inflation[Line == LineOfBusiness,.(WRITN_YEAR, prem_multiplier)], by = "WRITN_YEAR", all.x = T, all.y = F)
+  import_GWP$LEVELLED_GWP <- import_GWP$GWP * ifelse(!is.na(import_GWP$prem_multiplier), import_GWP$prem_multiplier, 1)
+  
+  # LINE SPECIFIC FILTERING.
+  import_GWP = LINE_SPECIFIC_FILTERING_PREMIUM(import_GWP, LOB)
+
+  import_GWP[, GWP := sum(GWP, na.rm = T), by = c("CUST_ACCT_NUM", "WRITN_YEAR")]
+  import_GWP[, LEVELLED_GWP := sum(LEVELLED_GWP, na.rm = T), by = c("CUST_ACCT_NUM", "WRITN_YEAR")]
+  import_GWP[, COMM := sum(COMM, na.rm = T), by = c("CUST_ACCT_NUM", "WRITN_YEAR")]
+  import_GWP[, POL_START := min(POL_PERIOD_START, na.rm = T), by = c("CUST_ACCT_NUM", "WRITN_YEAR")]
+  import_GWP[, POL_END := max(POL_PERIOD_END, na.rm = T), by = c("CUST_ACCT_NUM", "WRITN_YEAR")]
+  
+  # temp <- import_GWP[, .(ALL_GCS_TIERS = CALC_MODE(GCS_TIER)), by = c("CUST_ACCT_NUM", "WRITN_YEAR")]
+  # import_GWP <- merge(import_GWP, temp, by = c("CUST_ACCT_NUM", "WRITN_YEAR") ,all.x=T, all.y=F)
+  
+  # Summarize, using the most common value (mode), ignoring NAs.
+  return(import_GWP[, lapply(.SD, CALC_MODE), by = c("CUST_ACCT_NUM", "WRITN_YEAR")][GWP > 0 & LEVELLED_GWP > 0])
+}
+
+LINE_SPECIFIC_FILTERING_PREMIUM = function(import_GWP, LOB){
+  # Add in filter for TEST CASE PLEASE DISREGARD?
+  
+  if(LOB == "PRI"){
+    import_GWP[INSD_NM %like% "ZENNOR", INSD_NM := "ZENNOR"]
+    import_GWP[INSD_NM %like% "GRAYS INN" | INSD_NM %like% "WALLACE ESTATES", INSD_NM := "GRAYS INN WALLACE ESTATES"]
+    import_GWP$INSD_NM = LINKED_POLICIES(import_GWP, LOB)
     
-    def transform(self, X):
-        """Apply feature filtering"""
-        if self.features_to_keep_ is None:
-            raise ValueError("FeatureFilter not fitted yet")
-            
-        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        return X_df.loc[:, self.features_to_keep_].values
+    # Remove Zennor, Unite, P3 for 2024
+    import_GWP[!(INSD_NM %like% "ZENNOR" & INSD_NM %like% "UNITE" & INSD_NM %like% "P3")]
     
-    def get_feature_names_out(self, input_features=None):
-        """Get output feature names"""
-        if self.features_to_keep_ is None:
-            raise ValueError("FeatureFilter not fitted yet")
-            
-        if input_features is None:
-            return [f"feature_{i}" for i in range(self.features_to_keep_.sum())]
-        else:
-            return [name for name, keep in zip(input_features, self.features_to_keep_) if keep]
-
-
-class FrequencyModelConfig:
-    """Configuration constants for the frequency model"""
-    EARLY_STOPPING_ROUNDS = 50
-    N_TRIALS_DEFAULT = 100  # Increased for better hyperparameter optimization on small datasets
-    RANDOM_STATE = 12
-   
-    # Test year (2024 reserved for testing)
-    TEST_YEAR = 2024
+    return(import_GWP[!(LEVEL_2_FEATURE_GROUP_DESC %like% "Terrorism" | SOURCE_SYSTEM_DESC %like% "FastTrade")])
+  }
+  else if(LOB == "PRC"){
+    # Remove mis-labelled policies.
+    alpha_codes_to_remove <- c("RPI", "OSP", "SSP", "MWP", "PRP", "SEP")
+    for(alpha in alpha_codes_to_remove){
+      import_GWP <- import_GWP[!(POL_NUMBER %like% alpha)]
+    }
+  }
+  else if(LOB == "MTR"){
+    # Remove mis-labelled policies.
+    # MF policies are SME.
+    alpha_codes_to_remove <- c("MF")
+    for(alpha in alpha_codes_to_remove){
+      import_GWP = import_GWP[!(POL_NUMBER %like% alpha)]
+    }
+  }
+  else if(LOB == "MUK"){
+    # Remove Hull policies, since they are no longer written.
+    # Also remove fast-trade (not in scope)
+    import_GWP = import_GWP[LOB_SUB_GROUP_2 != "Hull"][SOURCE_SYSTEM_DESC %in% c("Guidewire PolicyCenter 2", "Polisy")]
+  }
+  else if(LOB == "LIAB"){
+    # HIG is out of scope. Remove anything with HIG broker
+    import_GWP = import_GWP[!(BROKERALL_CD %like% "HIG ")]
     
-    # Train/validation split parameters
-    TRAIN_SIZE = 0.8  # 80% train, 20% validation from non-test data
-   
-    # Hyperparameter dimensions for Gaussian Process Bayesian optimization
-    # Optimized for small datasets with lower eta and moderate n_estimators (750)
-    PARAM_DIMENSIONS = [
-        Integer(3, 8, name='max_depth'),
-        Real(0.005, 0.2, prior='log-uniform', name='eta'),  # Lowered for slower, more stable learning
-        Real(0.6, 1.0, name='subsample'),
-        Real(0.6, 1.0, name='colsample_bytree'),
-        Integer(1, 5, name='min_child_weight'),
-        Real(0.0, 1.0, name='gamma'),
-        Real(0.0, 2.0, name='max_delta_step')
-    ]
-
-
-class FrequencyModel:
-   
-    def __init__(self, config: Optional[FrequencyModelConfig] = None):
-        self.config = config or FrequencyModelConfig()
-        self.random_state = self.config.RANDOM_STATE
-        self.model = None
-        self.preprocessor = None  # sklearn Pipeline (ColumnTransformer + FeatureFilter)
-        self.feature_names = None
-        self.target_feature = "NUM_LOSSES"
-        self.objective = "count:poisson"
-        self.eval_metric = "poisson-nloglik"
-        self.monotone_constraints = None
-        self.best_params = None
-        self.evaluation_results = None
-        
-        # Model metadata
-        self.training_metadata = {}
-
-    def load_csv_data(self, policy_file: str, account_file: str, claims_file: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Load CSV files for frequency modeling"""
-        policy_list_all = pd.read_csv(policy_file)
-        account_list = pd.read_csv(account_file)
-        account_list = account_list.rename(columns={col: col.upper() for col in account_list.columns})
-        claims_list = pd.read_csv(claims_file)
-        
-        return policy_list_all, account_list, claims_list
-
-    def validate_features(self, data: pd.DataFrame, required_features: List[str]):
-        """Validate all required features are present"""
-        missing_features = set(required_features) - set(data.columns)
-        if missing_features:
-            raise ValueError(
-                f"Missing required features for model prediction: {missing_features}\n"
-                f"Available features: {list(data.columns)}\n"
-                f"This indicates a data pipeline issue that needs to be fixed upstream."
-            )
-
-    def create_random_splits(self, df: pd.DataFrame, year_col: str = 'WRITN_YEAR') -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Create random train/validation splits with 2024 as test set
-        """
-        # Separate test data (2024)
-        test_data = df[df[year_col] == self.config.TEST_YEAR].copy()
-        
-        # Get non-test data for train/validation split
-        non_test_data = df[df[year_col] != self.config.TEST_YEAR].copy()
-        
-        # Random split for train/validation
-        if len(non_test_data) > 0:
-            # Create stratification groups for better splitting
-            stratify_groups = self.create_grouped_stratification(non_test_data[self.target_feature])
-            
-            train_data, val_data = train_test_split(
-                non_test_data,
-                test_size=(1 - self.config.TRAIN_SIZE),
-                random_state=self.random_state,
-                stratify=stratify_groups
-            )
-        else:
-            train_data = pd.DataFrame()
-            val_data = pd.DataFrame()
-        
-        print(f"Random splits created:")
-        print(f"  Train (random): {len(train_data):,} accounts")
-        print(f"  Validation (random): {len(val_data):,} accounts")
-        print(f"  Test ({self.config.TEST_YEAR}): {len(test_data):,} accounts")
-        
-        return train_data, val_data, test_data
-
-    def create_grouped_stratification(self, num_losses: pd.Series) -> pd.Series:
-        """Group rare values for stratification"""
-        def group_losses(x):
-            if pd.isna(x):
-                return "missing"
-            elif x == 0:
-                return "zero"
-            elif x == 1:
-                return "one"
-            elif x == 2:
-                return "two"
-            else:
-                return "three_plus"
-        
-        return num_losses.apply(group_losses)
-
-    def create_preprocessor(self, non_ohe_features: List[str], ohe_features: List[str]) -> Pipeline:
-        """Create sklearn Pipeline with ColumnTransformer and FeatureFilter"""
-        
-        column_transformer = ColumnTransformer(
-            transformers=[
-                ('num', 'passthrough', [f.upper() for f in non_ohe_features]),
-                ('cat', OneHotEncoder(sparse_output=False, drop=None, handle_unknown='ignore'), 
-                 [f.upper() for f in ohe_features])
-            ],
-            remainder='drop'
-        )
-        
-        # Create full pipeline
-        pipeline = Pipeline([
-            ('preprocessor', column_transformer),
-            ('feature_filter', FeatureFilter())
-        ])
-        
-        return pipeline
-
-    def prepare_data(self, account_data: pd.DataFrame, target_feature: str) -> pd.DataFrame:
-        """Prepare data with basic cleaning and type conversions"""
-        # Convert column names to uppercase
-        data = account_data.rename(columns={col: col.upper() for col in account_data.columns})
-        target_feature = target_feature.upper()
-        
-        # Handle HIST_LR_3YEAR special case
-        if "HIST_LR_3YEAR" in data.columns:
-            data["HIST_LR_3YEAR"] = data["HIST_LR_3YEAR"].apply(
-                lambda x: np.nan if pd.isna(x) else 1 if x > 1 else x
-            )
-        
-        # Convert object columns to category for better handling
-        for col in data.select_dtypes(include=['object']).columns:
-            data[col] = data[col].astype('category')
-        
-        # Set target variable
-        if target_feature in data.columns:
-            data["target"] = data[target_feature]
-        
-        return data
-
-    def create_monotone_constraints(self, feature_names: List[str]) -> str:
-        """Create monotone constraints for frequency model"""
-        constraints = []
-        
-        for col in feature_names:
-            if "A. BELOW" in col:
-                constraints.append("-1")  # Smaller band → fewer claims
-            elif any(x in col for x in ["B. FROM", "C. OVER", "D. UNKNOWN", "LR_3YEAR"]):
-                constraints.append("1")   # Larger band or higher LR → more claims
-            else:
-                constraints.append("0")   # No constraint
-        
-        constraint_string = f"({','.join(constraints)})"
-        
-        # Summary
-        n_increasing = constraints.count("1")
-        n_decreasing = constraints.count("-1")
-        n_none = constraints.count("0")
-        
-        print(f"Monotone constraints: {n_increasing} increasing, {n_decreasing} decreasing, {n_none} unconstrained")
-        
-        return constraint_string
-
-    def optimize_hyperparameters(self, X_train: np.ndarray, y_train: np.ndarray, 
-                                X_val: np.ndarray, y_val: np.ndarray,
-                                n_trials: int = 100) -> Tuple[Dict[str, Any], float]:
-        """
-        Gaussian Process Bayesian optimization using scikit-optimize
-        
-        Uses gp_minimize for sample-efficient hyperparameter optimization.
-        Ideal for small-medium parameter spaces (7 parameters) with 100 trials.
-        """
-        
-        print(f"Starting Gaussian Process Bayesian Optimization ({n_trials} trials)...")
-        print("Using conservative hyperparameters optimized for small datasets:")
-        print("  - Lower eta range (0.005-0.2) for gradual learning")
-        print("  - n_estimators=750 with early stopping for convergence")
-        
-        # Define objective function using decorator
-        @use_named_args(self.config.PARAM_DIMENSIONS)
-        def objective(**params):
-            """
-            Objective function for Gaussian Process optimization
-            Returns value to minimize (positive Poisson deviance)
-            """
-            try:
-                # Create XGBRegressor with current parameters
-                model = xgb.XGBRegressor(
-                    objective='count:poisson',
-                    booster='gbtree',
-                    tree_method='exact',
-                    monotone_constraints=self.monotone_constraints,
-                    early_stopping_rounds=self.config.EARLY_STOPPING_ROUNDS,
-                    eval_metric='poisson-nloglik',
-                    random_state=self.random_state,
-                    seed=self.random_state,
-                    n_estimators=750,  # Manager's recommendation for small datasets with lower eta
-                    validate_parameters=True,
-                    **params  # Unpack the hyperparameters
-                )
-                
-                # Fit model with early stopping
-                model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_val, y_val)],
-                    eval_metric='poisson-nloglik',
-                    verbose=False
-                )
-                
-                # Make predictions and calculate Poisson deviance
-                y_pred = model.predict(X_val)
-                deviance = mean_poisson_deviance(y_val, y_pred)
-                
-                return deviance  # Return positive deviance (to minimize)
-                
-            except Exception as e:
-                print(f"Error in objective function: {e}")
-                return 999999  # Large positive value for failed trials
-        
-        # Gaussian Process Bayesian optimization (most sample-efficient)
-        result = gp_minimize(
-            func=objective,
-            dimensions=self.config.PARAM_DIMENSIONS,
-            n_calls=n_trials,
-            n_initial_points=10,  # Random exploration phase
-            random_state=self.random_state,
-            verbose=True
-        )
-        
-        # Extract best parameters
-        best_params = {}
-        for i, param_name in enumerate([dim.name for dim in self.config.PARAM_DIMENSIONS]):
-            best_params[param_name] = result.x[i]
-        
-        best_score = result.fun  # This is the minimized Poisson deviance
-        
-        print(f"Optimization complete! Best validation score: {best_score:.6f}")
-        print("Best parameters:")
-        for param, value in best_params.items():
-            if isinstance(value, float):
-                print(f"  {param}: {value:.4f}")
-            else:
-                print(f"  {param}: {value}")
-        
-        return best_params, best_score
-
-    def train_model(self, account_data: pd.DataFrame,
-                   non_ohe_features: List[str],
-                   ohe_features: List[str],
-                   year_col: str = 'WRITN_YEAR',
-                   n_trials: int = None) -> Dict[str, Any]:
-        """
-        Train frequency model with sklearn pipeline preprocessing and GP optimization
-        """
-        
-        n_trials = n_trials or self.config.N_TRIALS_DEFAULT
-        start_time = datetime.now()
-        print("="*60)
-        print("STARTING FREQUENCY MODEL TRAINING")
-        print("="*60)
-        
-        # Store training metadata
-        self.training_metadata = {
-            'start_time': start_time.isoformat(),
-            'n_trials': n_trials,
-            'optimization_method': 'Gaussian Process (gp_minimize)',
-            'features': {
-                'non_ohe': non_ohe_features,
-                'ohe': ohe_features
-            }
-        }
-        
-        # 1. Create random splits
-        print("Step 1: Creating random splits...")
-        train_data, val_data, test_data = self.create_random_splits(account_data, year_col)
-        
-        # 2. Prepare data
-        target_col = self.target_feature if self.target_feature in account_data.columns else self.target_feature.lower()
-        
-        print("Step 2: Preparing data...")
-        train_prepared = self.prepare_data(train_data, target_col)
-        val_prepared = self.prepare_data(val_data, target_col)
-        test_prepared = self.prepare_data(test_data, target_col)
-        
-        # 3. Create and fit preprocessor pipeline
-        print("Step 3: Creating and fitting preprocessing pipeline...")
-        self.preprocessor = self.create_preprocessor(non_ohe_features, ohe_features)
-        
-        # Get feature columns (exclude target) and validate they exist
-        all_features = [f.upper() for f in non_ohe_features + ohe_features]
-        
-        # Validate that all required features are present in training data
-        self.validate_features(train_prepared, all_features)
-        print(f"✅ All {len(all_features)} required features validated in training data")
-        
-        # Validate that all required features are present in validation data  
-        self.validate_features(val_prepared, all_features)
-        print(f"✅ All {len(all_features)} required features validated in validation data")
-        
-        # Now we can safely use the features
-        available_features = all_features  # All are validated to be present
-        
-        # Fit pipeline on training data
-        X_train = train_prepared[available_features]
-        y_train = train_prepared["target"]
-        
-        # Fit and transform training data using the pipeline
-        X_train_processed = self.preprocessor.fit_transform(X_train)
-        
-        # Transform validation data using the fitted pipeline
-        X_val = val_prepared[available_features]
-        y_val = val_prepared["target"]
-        X_val_processed = self.preprocessor.transform(X_val)
-        
-        # Get feature names from the pipeline
-        # First get names from the column transformer
-        column_transformer = self.preprocessor.named_steps['preprocessor']
-        raw_feature_names = column_transformer.get_feature_names_out()
-        
-        # Then get the filtered feature names
-        feature_filter = self.preprocessor.named_steps['feature_filter']
-        self.feature_names = feature_filter.get_feature_names_out(raw_feature_names)
-        
-        print(f"Features after column transformation: {len(raw_feature_names)}")
-        print(f"Features after filtering: {len(self.feature_names)}")
-        print(f"Training data: {X_train_processed.shape}")
-        print(f"Validation data: {X_val_processed.shape}")
-        
-        # 4. Create monotone constraints
-        print("Step 4: Creating monotone constraints...")
-        self.monotone_constraints = self.create_monotone_constraints(self.feature_names)
-        
-        # 5. Gaussian Process Bayesian optimization
-        print("Step 5: Hyperparameter optimization using Gaussian Process...")
-        self.best_params, best_score = self.optimize_hyperparameters(
-            X_train_processed, y_train.values, 
-            X_val_processed, y_val.values, 
-            n_trials
-        )
-        
-        # 6. Train final model with best parameters
-        print("Step 6: Training final model...")
-        
-        # Create final XGBRegressor with best parameters
-        final_params = {
-            "objective": self.objective,
-            "eval_metric": self.eval_metric,
-            "booster": "gbtree",
-            "tree_method": "exact",
-            "monotone_constraints": self.monotone_constraints,
-            "early_stopping_rounds": self.config.EARLY_STOPPING_ROUNDS,
-            "validate_parameters": True,
-            "random_state": self.random_state,
-            "seed": self.random_state,
-            "n_estimators": 750  # Manager's recommendation for small datasets with lower eta
-        }
-        final_params.update(self.best_params)
-        
-        self.model = xgb.XGBRegressor(**final_params)
-        
-        print("Training final frequency model with best parameters...")
-        print(f"Using lower eta range (0.005-0.2) and n_estimators=750 for stable learning on small dataset")
-        
-        # Train with validation set for early stopping
-        self.model.fit(
-            X_train_processed, y_train,
-            eval_set=[(X_train_processed, y_train), (X_val_processed, y_val)],
-            eval_metric='poisson-nloglik',
-            verbose=50  # Print every 50 rounds
-        )
-        
-        # Get best iteration and score from the model
-        best_iteration = self.model.best_iteration if hasattr(self.model, 'best_iteration') else len(self.model.get_booster().get_dump())
-        
-        print(f"Final model: {best_iteration} trees, best score: {best_score:.6f}")
-        
-        # 7. Evaluate on test data
-        print("Step 7: Evaluating on test data...")
-        
-        # Validate test data has required features
-        self.validate_features(test_prepared, available_features)
-        print(f"✅ All {len(available_features)} required features validated in test data")
-        
-        test_predictions = self.predict(test_prepared, available_features)
-        test_actual = test_prepared["target"].values
-        
-        self.evaluation_results = self.comprehensive_evaluation(
-            test_prepared, test_actual, test_predictions
-        )
-        
-        # Complete training metadata
-        end_time = datetime.now()
-        self.training_metadata.update({
-            'end_time': end_time.isoformat(),
-            'training_duration': str(end_time - start_time),
-            'best_iteration': best_iteration,
-            'best_score': best_score,
-            'xgboost_version': xgb.__version__,
-            'total_features': len(self.feature_names)
-        })
-        
-        print(f"\nTraining completed successfully in {end_time - start_time}")
-        print("="*60)
-        
-        return {
-            "model": self.model,
-            "best_params": self.best_params,
-            "best_score": best_score,
-            "feature_names": self.feature_names,
-            "preprocessor": self.preprocessor,
-            "evaluation_results": self.evaluation_results,
-            "train_data": train_data,
-            "val_data": val_data,
-            "test_data": test_data,
-            "training_metadata": self.training_metadata
-        }
-
-    def predict(self, new_data: pd.DataFrame, feature_columns: List[str]) -> np.ndarray:
-        """Make predictions using the fitted preprocessing pipeline and model"""
-        if self.model is None:
-            raise ValueError("Model not trained yet. Call train_model() first.")
-        
-        if self.preprocessor is None:
-            raise ValueError("Preprocessing pipeline not fitted. Model may not be properly trained.")
-        
-        # Validate that all required features are present
-        required_features = [f.upper() for f in feature_columns]
-        self.validate_features(new_data, required_features)
-        print(f"✅ All {len(required_features)} required features validated in prediction data")
-        
-        # Use only the specified feature columns (all validated to be present)
-        X = new_data[required_features]
-        
-        # Apply the full preprocessing pipeline (ColumnTransformer + FeatureFilter)
-        X_processed = self.preprocessor.transform(X)
-        
-        print(f"Prediction data processed through pipeline: {X_processed.shape}")
-        
-        # Make predictions using sklearn XGBRegressor
-        return self.model.predict(X_processed)
-
-    def comprehensive_evaluation(self, test_data: pd.DataFrame, y_test: np.ndarray, predictions: np.ndarray) -> Dict[str, Any]:
-        """Comprehensive evaluation metrics for frequency model"""
-        
-        # Basic Performance Metrics using sklearn's mean_poisson_deviance
-        basic_metrics = {
-            'poisson_deviance': mean_poisson_deviance(y_test, predictions),
-            'mae': mean_absolute_error(y_test, predictions),
-            'rmse': np.sqrt(mean_squared_error(y_test, predictions)),
-            'mean_actual': y_test.mean(),
-            'mean_predicted': predictions.mean(),
-            'mean_ratio': predictions.mean() / y_test.mean() if y_test.mean() > 0 else np.nan,
-            'n_test_accounts': len(y_test)
-        }
-        
-        # RMSE/NRMSE analysis
-        rmse_value = basic_metrics['rmse']
-        nrmse_results = {
-            "sd": rmse_value / np.std(y_test),
-            "mean": rmse_value / np.mean(y_test),
-            "median": rmse_value / np.median(y_test),
-            "maxmin": rmse_value / (np.max(y_test) - np.min(y_test))
-        }
-        
-        # Distribution comparison
-        actual_dist = pd.Series(y_test).value_counts().sort_index()
-        pred_dist = pd.Series(np.round(predictions)).value_counts().sort_index()
-        
-        all_values = sorted(set(list(actual_dist.index) + list(pred_dist.index)))
-        actual_dist = actual_dist.reindex(all_values, fill_value=0)
-        pred_dist = pred_dist.reindex(all_values, fill_value=0)
-        
-        distribution_comparison = pd.DataFrame({
-            'Actual_Count': actual_dist,
-            'Predicted_Count': pred_dist,
-            'Actual_Pct': actual_dist / len(y_test) * 100,
-            'Predicted_Pct': pred_dist / len(predictions) * 100
-        })
-        
-        # Yearly analysis if year column exists
-        yearly_analysis = None
-        if 'WRITN_YEAR' in test_data.columns:
-            test_results = test_data.copy()
-            test_results['predicted_losses'] = predictions
-            test_results['actual_losses'] = y_test
-            
-            yearly_analysis = test_results.groupby('WRITN_YEAR').agg({
-                'actual_losses': ['count', 'mean', 'sum'],
-                'predicted_losses': ['mean', 'sum']
-            }).round(4)
-        
-        return {
-            'basic_metrics': basic_metrics,
-            'nrmse_results': nrmse_results,
-            'distribution_comparison': distribution_comparison,
-            'yearly_analysis': yearly_analysis
-        }
-
-    def get_feature_importance(self, importance_type: str = 'weight') -> pd.DataFrame:
-        """Get feature importance as a DataFrame"""
-        if self.model is None:
-            raise ValueError("Model not trained yet.")
-        
-        # For sklearn XGBRegressor, get importance from the booster
-        if hasattr(self.model, 'get_booster'):
-            importance = self.model.get_booster().get_score(importance_type=importance_type)
-        else:
-            # Fallback to feature_importances_ attribute
-            importance_values = getattr(self.model, 'feature_importances_', None)
-            if importance_values is None:
-                raise ValueError("No feature importance available from model")
-            importance = dict(zip(self.feature_names, importance_values))
-        
-        # Convert to DataFrame
-        importance_df = pd.DataFrame([
-            {'feature': k, 'importance': v}
-            for k, v in importance.items()
-        ])
-        
-        # Sort by importance
-        importance_df = importance_df.sort_values('importance', ascending=False)
-        importance_df['rank'] = range(1, len(importance_df) + 1)
-        importance_df['importance_pct'] = (importance_df['importance'] /
-                                          importance_df['importance'].sum() * 100)
-        
-        return importance_df
-
-    def save_model(self, filepath: str):
-        """Save the complete trained frequency model and sklearn pipeline"""
-        if self.model is None:
-            raise ValueError("Model not trained yet.")
-        
-        model_artifacts = {
-            "model": self.model,
-            "preprocessor": self.preprocessor,
-            "feature_names": self.feature_names,
-            "target_feature": self.target_feature,
-            "objective": self.objective,
-            "eval_metric": self.eval_metric,
-            "monotone_constraints": self.monotone_constraints,
-            "best_params": self.best_params,
-            "evaluation_results": self.evaluation_results,
-            "training_metadata": self.training_metadata,
-            "config": self.config
-        }
-        
-        joblib.dump(model_artifacts, filepath)
-        print(f"Frequency model saved to {filepath}")
-
-    def load_model(self, filepath: str):
-        """Load a trained frequency model and sklearn pipeline"""
-        model_artifacts = joblib.load(filepath)
-        
-        self.model = model_artifacts["model"]
-        self.preprocessor = model_artifacts["preprocessor"]
-        self.feature_names = model_artifacts["feature_names"]
-        self.target_feature = model_artifacts["target_feature"]
-        self.objective = model_artifacts["objective"]
-        self.eval_metric = model_artifacts["eval_metric"]
-        self.monotone_constraints = model_artifacts["monotone_constraints"]
-        self.best_params = model_artifacts["best_params"]
-        self.evaluation_results = model_artifacts["evaluation_results"]
-        self.training_metadata = model_artifacts.get("training_metadata", {})
-        self.config = model_artifacts.get("config", FrequencyModelConfig())
-        
-        print(f"Frequency model loaded from {filepath}")
-
-    def plot_feature_importance(self, max_features: int = 20):
-        """Plot feature importance"""
-        if self.model is None:
-            raise ValueError("Model not trained yet.")
-        
-        fig, ax = plt.subplots(figsize=(10, 8))
-        
-        # For sklearn XGBRegressor, plot using the booster
-        if hasattr(self.model, 'get_booster'):
-            xgb.plot_importance(self.model.get_booster(), importance_type='weight',
-                               max_num_features=max_features, ax=ax)
-        else:
-            # Fallback: create manual plot from feature_importances_
-            importance_df = self.get_feature_importance()
-            top_features = importance_df.head(max_features)
-            ax.barh(range(len(top_features)), top_features['importance'])
-            ax.set_yticks(range(len(top_features)))
-            ax.set_yticklabels(top_features['feature'])
-            ax.set_xlabel('Importance')
-            
-        plt.title("Frequency Model - Feature Importance")
-        plt.tight_layout()
-        return fig
-
-    def print_evaluation_summary(self):
-        """Print comprehensive evaluation summary"""
-        if self.evaluation_results is None:
-            print("No evaluation results available. Train model first.")
-            return
-        
-        print("="*60)
-        print("FREQUENCY MODEL EVALUATION SUMMARY")
-        print("="*60)
-        
-        print("\n1. BASIC PERFORMANCE METRICS:")
-        for metric, value in self.evaluation_results['basic_metrics'].items():
-            if metric != 'n_test_accounts':
-                print(f"   {metric}: {value:.6f}")
-            else:
-                print(f"   {metric}: {value:,}")
-        
-        print("\n2. NORMALIZED RMSE:")
-        for norm_type, value in self.evaluation_results['nrmse_results'].items():
-            print(f"   NRMSE ({norm_type}): {value:.6f}")
-        
-        print("\n3. DISTRIBUTION COMPARISON:")
-        print(self.evaluation_results['distribution_comparison'])
-        
-        if self.evaluation_results['yearly_analysis'] is not None:
-            print("\n4. YEARLY ANALYSIS:")
-            print(self.evaluation_results['yearly_analysis'])
-
-
-# Helper function for quick model training
-def train_frequency_model(account_data: pd.DataFrame,
-                         non_ohe_features: List[str],
-                         ohe_features: List[str],
-                         n_trials: int = 100,
-                         save_path: Optional[str] = None) -> FrequencyModel:
-    """
-    Convenience function to train a frequency model using Gaussian Process optimization
+    # Segment allocation for large accounts.
+    import_GWP[INSD_NM %like% "BABCOCK " | INSD_NM %like% "KRONOSPAN ", GCS_SEGMENT := "Industrial & Business Services"]
+    import_GWP[INSD_NM %like% "BCA MARKETPLACE " | INSD_NM %like% "MARSTONS " | INSD_NM %like% "MIDLOTHIAN CAPITAL " | INSD_NM %like% "LSH AUTO ", GCS_SEGMENT := "Retail & Leisure"]
+    import_GWP[INSD_NM %like% "MEARS GROUP" | INSD_NM %like% "URBACON TRADING ", GCS_SEGMENT := "Real Estate & Construction"]
+    import_GWP[GCS_SEGMENT == "Unallocated", GCS_SEGMENT := "Financial & Professional Services"]
+  }
+  else if(LOB == "PI"){
+    # Create a field for Profession using mapping sheet
+    mapping_filepath = paste0("INPUTS/LOB/",LOB,"/polaris_code_mapping.csv")
+    mapping = read.csv(mapping_filepath, header = TRUE)
+    colnames(mapping)[1] = str_remove(colnames(mapping)[1], "ï..")
     
-    Uses gp_minimize for optimal hyperparameter search on small-medium parameter spaces.
-    """
-    # Initialize model
-    freq_model = FrequencyModel()
+    import_GWP = merge(import_GWP, mapping, 
+                     by.x = "POLARIS_TRADE_CD_CURR", by.y = "POLARIS_TRADE_CD_CURR", all.x = T, all.y = F)
     
-    # Train using Gaussian Process optimization
-    results = freq_model.train_model(
-        account_data,
-        non_ohe_features,
-        ohe_features,
-        n_trials=n_trials
+    # Remove FastTrade policies (as requested by)
+    import_GWP = import_GWP[!(POL_NUMBER %like% "CHC")]
+    import_GWP = import_GWP[SOURCE_SYSTEM_DESC != "FastTrade"]
+  }
+  
+  return(import_GWP)
+}
+
+GET_CLAIMS_DATA = function(LOB, LineOfBusiness, i_inflation, year_cutoff){
+  claims_query_txt = paste0("SELECT CLM_REF, CLM_CUST_POL_REF, WRITN_YEAR, INSD_NM, 
+                            CAT_REF, CLM_FUNCT_GRS_INC_AMT, CLM_DTE_TRANS, CL_LOB_5, 
+                            LOB_SUB_GROUP_1, LOB_SUB_GROUP_2, LOB_SUB_GROUP_3
+                            FROM GCS_BI.PRIC_CL_CLMS WHERE CL_LOB_1 = 'GCS' AND CL_LOB_5 = ? 
+                            AND WRITN_YEAR >= ?;")
+  
+  claims_inputs = list(LineOfBusiness, year_cutoff)
+  sql_query = dbSendQuery(con, claims_query_txt)
+  dbBind(sql_query, claims_inputs)
+  import_CLMS = as.data.table(dbFetch(sql_query))
+  dbClearResult(sql_query)
+  
+  import_CLMS$POL_NUMBER <- import_CLMS$CLM_CUST_POL_REF
+  import_CLMS[, CUST_ACCT_NUM := STANDARDIZE_POL_NUMBER(CLM_CUST_POL_REF)]
+  import_CLMS$INSURED <- import_CLMS$INSD_NM
+  import_CLMS[, INSD_NM := STANDARDIZE_INSURED(INSD_NM)]
+  
+  import_CLMS[, TRANSACTION_DATE := as.Date(CLM_DTE_TRANS)]
+  
+  import_CLMS$CAT_FLAG <- ifelse(is.na(import_CLMS$CAT_REF), FALSE, ifelse(import_CLMS$CAT_REF == "", FALSE, TRUE))
+  
+  import_CLMS = LINE_SPECIFIC_FILTERING_CLMS(import_CLMS, LOB)
+  
+  import_CLMS <- import_CLMS[WRITN_YEAR >= year_cutoff]
+  import_CLMS <- merge(import_CLMS, i_inflation[Line == LineOfBusiness,.(WRITN_YEAR, claims_multiplier)], by = "WRITN_YEAR", all.x = T, all.y = F)
+  import_CLMS$LEVELLED_CLM_FUNCT <- import_CLMS$CLM_FUNCT_GRS_INC_AMT * ifelse(!is.na(import_CLMS$claims_multiplier), 
+                                                                               import_CLMS$claims_multiplier, 1)
+  
+  import_CLMS[, INCURRED := sum(CLM_FUNCT_GRS_INC_AMT, na.rm = T), by = c("CUST_ACCT_NUM", "WRITN_YEAR", "CAT_FLAG")]
+  import_CLMS[, LEVELLED_INCURRED := sum(LEVELLED_CLM_FUNCT, na.rm = T), by = c("CUST_ACCT_NUM", "WRITN_YEAR", "CAT_FLAG")]
+  
+  return(import_CLMS[, lapply(.SD, CALC_MODE), by = c("CUST_ACCT_NUM", "WRITN_YEAR", "CAT_FLAG")][INCURRED > 0 & LEVELLED_INCURRED > 0])
+}
+
+LINE_SPECIFIC_FILTERING_CLMS = function(import_CLMS, LOB){
+  if(LOB == "PRI"){
+    import_CLMS[INSD_NM %like% "ZENNOR", INSD_NM := "ZENNOR"]
+    import_CLMS[INSD_NM %like% "GRAYS INN" | INSD_NM %like% "WALLACE ESTATES", INSD_NM := "GRAYS INN WALLACE ESTATES"]
+    import_CLMS$INSD_NM = LINKED_POLICIES(import_CLMS, LOB)
+  }
+  else if(LOB == "PRC"){
+    # Remove mis-labelled policies.
+    alpha_codes_to_remove <- c("RPI", "OSP", "SSP", "MWP", "PRP", "SEP")
+    for(alpha in alpha_codes_to_remove){
+      import_CLMS <- import_CLMS[!(POL_NUMBER %like% alpha)]
+    }
+  }
+  else if(LOB == "MTR"){
+    # Remove mis-labelled policies.
+    # MF policies are SME.
+    alpha_codes_to_remove <- c("MF")
+    for(alpha in alpha_codes_to_remove){
+      import_CLMS = import_CLMS[!(POL_NUMBER %like% alpha)]
+    }
+  }
+  else if(LOB == "MUK"){
+    # Remove Hull policies, since they are no longer written.
+    import_CLMS = import_CLMS[LOB_SUB_GROUP_2 != "Hull"]
+  }
+  
+  return(import_CLMS)
+}
+
+LINKED_POLICIES = function(dataset, LOB){
+  # Load in the linked_policies.csv for this LoB.
+  # Then map any policies with the given policy_numbers
+  # into a specific insured name.
+  # Returns just the INSD_NM column
+  
+  # Return early if mapping file doesn't exist.
+  mapping_filepath = paste0("INPUTS/LOB/",LOB,"linked_policies.csv")
+  if(!file.exists(mapping_filepath))
+    return(dataset$INSD_NM)
+  
+  mapping = read.csv(mapping_filepath, header = TRUE)
+  mapping[, pol_num := STANDARDIZE_POL_NUMBER(policy_number)]
+  # Dataset comes first to preserve order.
+  insureds = merge(dataset[,.(INSD_NM, CUST_ACCT_NUM)], mapping, 
+                   by.x = "CUST_ACCT_NUM", by.y = "pol_num", all.x = T)
+  insureds[, INSD_NM := ifelse(is.na(mapped_insured) | mapped_insured == "", INSD_NM, mapped_insured)]
+  return(insureds$INSD_NM)
+}
+
+GET_RATE_DATA = function(LineOfBusiness){
+  # Some lines don't have the standard format.
+  # For some reason, corp motor is motor in the rate app.
+  if(LineOfBusiness == "Corp Motor")
+    LineOfBusiness = "Motor"
+  
+  rate_query_txt = paste0("SELECT POLNUM, INSURED, EFFECTIVE_YEAR, 
+                          GWP_CURRENT, GWP_EXPIRING, GWP_TECHNICAL
+                          FROM GCS_BI.PRIC_GCS_RATE WHERE LOB = ?;")
+  
+  rate_inputs = list(LineOfBusiness)
+  sql_query = dbSendQuery(con, rate_query_txt)
+  dbBind(sql_query, rate_inputs)
+  import_RATE = as.data.table(dbFetch(sql_query))
+  dbClearResult(sql_query)
+  
+  names(import_RATE) = c("CUST_ACCT_NUM", "INSD_NM", "WRITN_YEAR", "GWP_CURRENT", "GWP_EXPIRING", "GWP_TECHNICAL")
+  
+  import_RATE[, CUST_ACCT_NUM := STANDARDIZE_POL_NUMBER(CUST_ACCT_NUM)]
+  import_RATE[, INSD_NM := STANDARDIZE_INSURED(INSD_NM)]
+  
+  import_RATE$RATE_CHANGE <- ifelse(import_RATE$GWP_EXPIRING > 0, (import_RATE$GWP_CURRENT/import_RATE$GWP_EXPIRING) - 1, NA)
+  import_RATE$RATE_STRENGTH <- ifelse(import_RATE$GWP_TECHNICAL > 0, (import_RATE$GWP_CURRENT/import_RATE$GWP_TECHNICAL), NA)
+  
+  # Used to assist the matching process
+  import_RATE$RATE_FLAG <- 1
+  
+  # Need to remove duplicates.
+  return(import_RATE[, 
+                     lapply(.SD, CALC_MODE), 
+                     by = c("CUST_ACCT_NUM", "WRITN_YEAR")
+                     ])
+}
+
+GET_EXPERIAN_DATA = function(){
+  hist_megafile <- readRDS("INPUTS/MEGAFILE/HIST_MEGAFILE_ALL_APRIL21.RDS")
+  # Need to have a process that creates an updated megafile every few months,
+  # rather than creating the experian sheet each month.
+  
+  # Used to assist the matching process
+  hist_megafile$EXP_FLAG <- 1
+  
+  #hist_megafile$POL_NUMBER <- hist_megafile$CUST_ACCT_NUM 
+  hist_megafile[, CUST_ACCT_NUM := STANDARDIZE_POL_NUMBER(CUST_ACCT_NUM)]
+  
+  # Filter to only the necessary columns
+  return(hist_megafile[,.(CUST_ACCT_NUM, PH_CO, WRITN_YEAR,
+                          #UK_SIC_2007_DESC
+                          FIN_RISK_SCR, NUM_SITES, TURNOVER_EST, 
+                          EMP_CT_LAST, CURRENT_ASSETS, ALL_SALES,
+                          LEGAL_STATUS, NUM_CHILD_LAYERS_B,
+                          EXP_FLAG)])
+}
+
+###### Section: CREATE HISTORICAL FEATURES ######
+GENERATE_POLICY_LIST = function(policy_list, claims_list, import_RATE, hist_megafile){
+  policy_list_all <- FILL_NA(data_input = policy_list, 
+                             summarizeBy = c("CUST_ACCT_NUM"),
+                             exceptions = c("GWP", "LEVELLED_GWP"))
+  
+  policy_list_all$CURRENT_3YEAR_LEVELLED_GWP <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                               data_for_summary = policy_list_all,
+                                                               summarizeBy = "CUST_ACCT_NUM",
+                                                               column_to_summarize = "LEVELLED_GWP",
+                                                               sumval = TRUE,
+                                                               numberYears = 3, 
+                                                               includeCurrentYear = TRUE)
+  
+  policy_list_all$HIST_3YEAR_LEVELLED_GWP <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                            data_for_summary = policy_list_all,
+                                                            summarizeBy = "CUST_ACCT_NUM",
+                                                            column_to_summarize = "LEVELLED_GWP",
+                                                            sumval = TRUE,
+                                                            numberYears = 3, 
+                                                            includeCurrentYear = FALSE)
+  
+  policy_list_all$CURRENT_3YEAR_GWP <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                      data_for_summary = policy_list_all,
+                                                      summarizeBy = "CUST_ACCT_NUM",
+                                                      column_to_summarize = "GWP",
+                                                      sumval = TRUE,
+                                                      numberYears = 3, 
+                                                      includeCurrentYear = TRUE)
+  
+  policy_list_all$CURRENT_3YEAR_INCURRED_NO_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                  data_for_summary = claims_list[CAT_FLAG == FALSE],
+                                                                  summarizeBy = "CUST_ACCT_NUM",
+                                                                  column_to_summarize = "INCURRED",
+                                                                  sumval = TRUE,
+                                                                  numberYears = 3, 
+                                                                  includeCurrentYear = TRUE)
+  
+  policy_list_all$CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                           data_for_summary = claims_list[CAT_FLAG == FALSE],
+                                                                           summarizeBy = "CUST_ACCT_NUM",
+                                                                           column_to_summarize = "LEVELLED_INCURRED",
+                                                                           sumval = TRUE,
+                                                                           numberYears = 3, 
+                                                                           includeCurrentYear = TRUE)
+  
+  policy_list_all$HIST_3YEAR_LEVELLED_INCURRED_NO_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                        data_for_summary = claims_list[CAT_FLAG == FALSE],
+                                                                        summarizeBy = "CUST_ACCT_NUM",
+                                                                        column_to_summarize = "LEVELLED_INCURRED",
+                                                                        sumval = TRUE,
+                                                                        numberYears = 3, 
+                                                                        includeCurrentYear = FALSE)
+  
+  policy_list_all$CURRENT_3YEAR_INCURRED_WITH_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                    data_for_summary = claims_list,
+                                                                    summarizeBy = "CUST_ACCT_NUM",
+                                                                    column_to_summarize = "INCURRED",
+                                                                    sumval = TRUE,
+                                                                    numberYears = 3, 
+                                                                    includeCurrentYear = TRUE)
+  
+  policy_list_all$CURRENT_3YEAR_LEVELLED_INCURRED_WITH_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                             data_for_summary = claims_list,
+                                                                             summarizeBy = "CUST_ACCT_NUM",
+                                                                             column_to_summarize = "LEVELLED_INCURRED",
+                                                                             sumval = TRUE,
+                                                                             numberYears = 3, 
+                                                                             includeCurrentYear = TRUE)
+  
+  policy_list_all$CURRENT_YEAR_INCURRED_NO_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                 data_for_summary = claims_list[CAT_FLAG == FALSE],
+                                                                 summarizeBy = "CUST_ACCT_NUM",
+                                                                 column_to_summarize = "INCURRED",
+                                                                 sumval = TRUE,
+                                                                 numberYears = 1, 
+                                                                 includeCurrentYear = TRUE)
+  
+  policy_list_all$CURRENT_YEAR_INCURRED_WITH_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                   data_for_summary = claims_list,
+                                                                   summarizeBy = "CUST_ACCT_NUM",
+                                                                   column_to_summarize = "INCURRED",
+                                                                   sumval = TRUE,
+                                                                   numberYears = 1, 
+                                                                   includeCurrentYear = TRUE)
+  
+  policy_list_all$CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                          data_for_summary = claims_list[CAT_FLAG == FALSE],
+                                                                          summarizeBy = "CUST_ACCT_NUM",
+                                                                          column_to_summarize = "LEVELLED_INCURRED",
+                                                                          sumval = TRUE,
+                                                                          numberYears = 1, 
+                                                                          includeCurrentYear = TRUE)
+  
+  policy_list_all$CURRENT_YEAR_LEVELLED_INCURRED_WITH_CAT <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                                            data_for_summary = claims_list,
+                                                                            summarizeBy = "CUST_ACCT_NUM",
+                                                                            column_to_summarize = "LEVELLED_INCURRED",
+                                                                            sumval = TRUE,
+                                                                            numberYears = 1, 
+                                                                            includeCurrentYear = TRUE)
+  
+  policy_list_all$COMM_3YEAR <- GET_HIST_VALUE(data_total = policy_list_all,
+                                               data_for_summary = policy_list_all,
+                                               summarizeBy = "CUST_ACCT_NUM",
+                                               column_to_summarize = "COMM",
+                                               sumval = TRUE,
+                                               numberYears = 3, 
+                                               includeCurrentYear = TRUE)
+  
+  policy_list_all$CLAIM_COUNT_1YEAR <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                      data_for_summary = claims_list,
+                                                      summarizeBy = "CUST_ACCT_NUM",
+                                                      column_to_summarize = "LEVELLED_INCURRED",
+                                                      sumval = FALSE,
+                                                      numberYears = 1, 
+                                                      includeCurrentYear = TRUE)
+  
+  policy_list_all[is.na(CLAIM_COUNT_1YEAR), CLAIM_COUNT_1YEAR := 0]
+  
+  policy_list_all$CLAIM_COUNT_3YEAR <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                      data_for_summary = claims_list,
+                                                      summarizeBy = "CUST_ACCT_NUM",
+                                                      column_to_summarize = "LEVELLED_INCURRED",
+                                                      sumval = FALSE,
+                                                      numberYears = 3, 
+                                                      includeCurrentYear = TRUE)
+  
+  policy_list_all[is.na(CLAIM_COUNT_3YEAR), CLAIM_COUNT_3YEAR := 0]
+  
+  policy_list_all$HIST_CLAIM_COUNT_3YEAR <- GET_HIST_VALUE(data_total = policy_list_all,
+                                                      data_for_summary = claims_list,
+                                                      summarizeBy = "CUST_ACCT_NUM",
+                                                      column_to_summarize = "LEVELLED_INCURRED",
+                                                      sumval = FALSE,
+                                                      numberYears = 3, 
+                                                      includeCurrentYear = FALSE)
+  
+  policy_list_all[is.na(HIST_CLAIM_COUNT_3YEAR), HIST_CLAIM_COUNT_3YEAR := 0]
+  
+  
+  policy_list_all[, CURRENT_3YEAR_LR_WITH_CAT := CURRENT_3YEAR_INCURRED_WITH_CAT / CURRENT_3YEAR_GWP]
+  
+  policy_list_all[, CURRENT_3YEAR_LR_NO_CAT := CURRENT_3YEAR_INCURRED_NO_CAT / CURRENT_3YEAR_GWP]
+  policy_list_all[, CURRENT_3YEAR_LEVELLED_LR_NO_CAT := CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT / CURRENT_3YEAR_LEVELLED_GWP]
+  
+  policy_list_all[, CURRENT_YEAR_LR_WITH_CAT := CURRENT_YEAR_INCURRED_WITH_CAT / GWP]
+  
+  policy_list_all[, CURRENT_YEAR_LR_NO_CAT := CURRENT_YEAR_INCURRED_NO_CAT / GWP]
+  policy_list_all[, CURRENT_YEAR_LEVELLED_LR_NO_CAT  := CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT / LEVELLED_GWP]
+  
+  policy_list_all[, HIST_3YEAR_LEVELLED_LR_NO_CAT := HIST_3YEAR_LEVELLED_INCURRED_NO_CAT / HIST_3YEAR_LEVELLED_GWP]
+  
+  policy_list_all[, AVG_CLAIM_SIZE_3YEAR := ifelse(is.na(CLAIM_COUNT_3YEAR) | CLAIM_COUNT_3YEAR <= 0,
+                                                    NA, CURRENT_3YEAR_LEVELLED_LR_NO_CAT / CLAIM_COUNT_3YEAR)]
+
+  # Merge on rate data and historical megafile data
+  # policy_list_all[["GWP_CURRENT"]] = NA
+  # policy_list_all[["GWP_EXPIRING"]] = NA
+  # policy_list_all[["GWP_TECHNICAL"]] = NA
+  # policy_list_all[["RATE_STRENGTH"]] = NA
+  # policy_list_all[["RATE_CHANGE"]] = NA
+  # policy_list_all[["RATE_FLAG"]] = NA
+  policy_list_all <- merge(policy_list_all,
+                           import_RATE[,.(CUST_ACCT_NUM, WRITN_YEAR, RATE_INS = INSD_NM,
+                                          GWP_CURRENT, GWP_EXPIRING, GWP_TECHNICAL, RATE_STRENGTH, RATE_CHANGE, RATE_FLAG)],
+                           by = c("CUST_ACCT_NUM", "WRITN_YEAR"),
+                           all.x = T, all.y = F)
+  
+  policy_list_all <- merge(policy_list_all, 
+                           hist_megafile,
+                           by = c("CUST_ACCT_NUM", "WRITN_YEAR"), 
+                           all.x = T, all.y = F)
+  
+  policy_list_all[, LEVELLED_GWP_TECH := ifelse(!is.na(GWP_TECHNICAL), 
+                                              GWP_TECHNICAL, GWP)]
+  
+  policy_list_all = policy_list_all[!duplicated(policy_list_all[,.(CUST_ACCT_NUM, WRITN_YEAR)])]
+  policy_list_all[, GWP_1YEAR := GWP]
+  
+  # Occasional issue with polaris name containing unencodable characters.
+  if("POLARIS_NAME" %in% colnames(policy_list_all)){
+    policy_list_all$POLARIS_NAME = sapply(policy_list_all$POLARIS_NAME, function(x){str_replace_all(x, "[^a-zA-Z0-9 ]", "")})
+  }
+  
+  return(policy_list_all)
+}
+
+###### Section: GENERATE ACCOUNT LIST ######
+GENERATE_ACCOUNT_LIST = function(policy_list_all, claims_list, year_cutoff,
+                                 features_freq, features_sev,
+                                 for_renewal = TRUE,
+                                 TIER_RNL_YEAR = "", TIER_RNL_MONTH = ""){
+  account_list = copy(policy_list_all[WRITN_YEAR >= year_cutoff && LEVELLED_GWP > 0])
+  
+  if(for_renewal){
+    account_list[, DEVELOPMENT := 6]
+  }
+  else{
+    account_list[, DEVELOPMENT := year(Sys.Date()) - WRITN_YEAR]
+    account_list[, DEVELOPMENT := ifelse(DEVELOPMENT > 6, 6, DEVELOPMENT)]
+  }
+  account_list[, DOMICILE_GRP := DOMICILE_GRP_2]
+  account_list[, DOMICILE_GRP_2 := NULL]
+  account_list[, TURNOVER := TURNOVER_EST]
+  account_list[, TURNOVER_EST := NULL]
+  account_list[, EMPLOYEES := EMP_CT_LAST]
+  account_list[, EMP_CT_LAST := NULL]
+  account_list[, ASSETS := CURRENT_ASSETS]
+  account_list[, CURRENT_ASSETS := NULL]
+  account_list[, BROKER_BAND := BROKER_BAND(BROKERALL_CD)]
+  
+  account_list[is.na(FIN_RISK_SCR), FIN_RISK_SCR := EXP_FIN_RISK_SCORE]
+  account_list[, FIN_RISK_SCR := as.numeric(FIN_RISK_SCR)]
+  account_list[, EXP_FIN_RISK_SCORE := NULL]
+  
+  account_list[is.na(LEGAL_STATUS), LEGAL_STATUS := EXP_LEGAL_STATUS]
+  account_list[, EXP_LEGAL_STATUS := NULL]
+  
+  account_list[, DIRECT_OR_RI := as.numeric(ifelse(is.na(DIRECT_OR_RI), 
+                                                 NA, 
+                                                 ifelse(DIRECT_OR_RI == "Reinsurance", 
+                                                        1, 0)))]
+  
+  # SUM GWP FIELDS
+  account_list[, GWP := sum(GWP, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  account_list[, LEVELLED_GWP := sum(LEVELLED_GWP, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  account_list[, LEVELLED_GWP_TECH := sum(LEVELLED_GWP_TECH, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  account_list[, CURRENT_3YEAR_LEVELLED_GWP := sum(CURRENT_3YEAR_LEVELLED_GWP, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  
+  # account_list[, COMM := sum(COMM, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  # account_list[, COMM_3YEAR := sum(COMM_3YEAR, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  
+  
+  # SUM INCURRED FIELDS
+  account_list[, CURRENT_YEAR_INCURRED_NO_CAT := sum(CURRENT_YEAR_INCURRED_NO_CAT, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  account_list[, CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT := sum(CURRENT_YEAR_LEVELLED_INCURRED_NO_CAT, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  
+  account_list[, num_losses := sum(CLAIM_COUNT_1YEAR, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+  
+  if(for_renewal){
+    # account_list[, CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT := sum(CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+    # SUM CLAIM COUNT FIELDS
+    #account_list[, CLAIM_COUNT_3YEAR := sum(CLAIM_COUNT_3YEAR, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+    
+    account_list$CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT = GET_HIST_VALUE(data_total = account_list,
+                                                                         data_for_summary = claims_list[CAT_FLAG == FALSE],
+                                                                         summarizeBy = "INSD_NM",
+                                                                         column_to_summarize = "LEVELLED_INCURRED",
+                                                                         sumval = TRUE,
+                                                                         numberYears = 3, 
+                                                                         includeCurrentYear = TRUE)
+    account_list$CURRENT_3YEAR_LEVELLED_GWP = GET_HIST_VALUE(data_total = account_list,
+                                                             data_for_summary = account_list,
+                                                             summarizeBy = "INSD_NM",
+                                                             column_to_summarize = "LEVELLED_GWP",
+                                                             sumval = TRUE,
+                                                             numberYears = 3, 
+                                                             includeCurrentYear = TRUE)
+    
+    account_list$CLAIM_COUNT_3YEAR <- GET_HIST_VALUE(data_total = account_list,
+                                                        data_for_summary = claims_list,
+                                                        summarizeBy = "CUST_ACCT_NUM",
+                                                        column_to_summarize = "LEVELLED_INCURRED",
+                                                        sumval = FALSE,
+                                                        numberYears = 3, 
+                                                        includeCurrentYear = TRUE)
+    
+    account_list[is.na(CLAIM_COUNT_3YEAR), CLAIM_COUNT_3YEAR := 0]
+  }
+  else{
+    # If not for renewal then we are training a model.
+    # We therefore need to get the historical features rather than current features,
+    # for historical LR, historical num losses, and historical avg claim count.
+    # SUM INCURRED FIELDS
+    # account_list[, CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT := sum(HIST_3YEAR_LEVELLED_INCURRED_NO_CAT, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+    account_list$CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT = GET_HIST_VALUE(data_total = account_list,
+                                                                       data_for_summary = claims_list[CAT_FLAG == FALSE],
+                                                                       summarizeBy = "INSD_NM",
+                                                                       column_to_summarize = "LEVELLED_INCURRED",
+                                                                       sumval = TRUE,
+                                                                       numberYears = 3, 
+                                                                       includeCurrentYear = FALSE)
+    account_list$CURRENT_3YEAR_LEVELLED_GWP = GET_HIST_VALUE(data_total = account_list,
+                                                                 data_for_summary = account_list,
+                                                                 summarizeBy = "INSD_NM",
+                                                                 column_to_summarize = "LEVELLED_GWP",
+                                                                 sumval = TRUE,
+                                                                 numberYears = 3, 
+                                                                 includeCurrentYear = FALSE)
+    # SUM CLAIM COUNT FIELDS
+    #account_list[, CLAIM_COUNT_3YEAR := sum(HIST_CLAIM_COUNT_3YEAR, na.rm = T), by = c("INSD_NM", "WRITN_YEAR")]
+    
+    account_list$CLAIM_COUNT_3YEAR <- GET_HIST_VALUE(data_total = account_list,
+                                                        data_for_summary = claims_list,
+                                                        summarizeBy = "INSD_NM",
+                                                        column_to_summarize = "LEVELLED_INCURRED",
+                                                        sumval = FALSE,
+                                                        numberYears = 3, 
+                                                        includeCurrentYear = FALSE)
+    
+  }
+
+  
+  # RE-CALCULATE AVERAGE CLAIM SIZE AND LR.
+  # We use the "current" figures when tiering, since we are predicted the tier for next year. Therefore the
+  # 3-year LR for next year includes this current year, last year, and the year before.
+  account_list[, AVG_CLAIM_SIZE_3YEAR := CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT / CLAIM_COUNT_3YEAR]
+  account_list[is.na(CLAIM_COUNT_3YEAR), CLAIM_COUNT_3YEAR := 0]
+  account_list[, HIST_LR_3YEAR := CURRENT_3YEAR_LEVELLED_INCURRED_NO_CAT / CURRENT_3YEAR_LEVELLED_GWP]
+  account_list[, HIST_LR_3YEAR := ifelse(HIST_LR_3YEAR > 2, 2, HIST_LR_3YEAR)]
+  
+  if(TIER_RNL_YEAR != "" & TIER_RNL_MONTH != ""){
+    # Ensure we retain those that are set to renew in the target month. We keep the rest
+    # around for the sake of forwardfilling data.
+    
+    TIER_RNL_YEAR_PREVIOUS <- as.character(as.numeric(TIER_RNL_YEAR) - 1)
+    account_list[, RNL_MONTH_FLAG := (RNL_MONTH == as.numeric(paste0(TIER_RNL_YEAR, TIER_RNL_MONTH))) |
+                   (is.na(RNL_MONTH) & as.character(INCEP_DATE) %like% paste0(TIER_RNL_YEAR_PREVIOUS,"-",TIER_RNL_MONTH,"-"))]
+    # Make sure we followthrough the renewal flag for accounts with any policies up for renewal.
+    account_list[, RNL_MONTH_FLAG := sum(RNL_MONTH_FLAG) > 0,
+                 by = c("INSD_NM", "WRITN_YEAR")]
+  }
+  else if(TIER_RNL_YEAR != ""){
+    # Ensure we retain those that are set to renew in the target month. We keep the rest
+    # around for the sake of forwardfilling data.
+    TIER_RNL_YEAR_PREVIOUS <- as.character(as.numeric(TIER_RNL_YEAR) - 1)
+    account_list[, RNL_MONTH_FLAG := (as.character(RNL_MONTH) %like% as.numeric(paste0(TIER_RNL_YEAR))) |
+                   (is.na(RNL_MONTH) & as.character(INCEP_DATE) %like% paste0(TIER_RNL_YEAR_PREVIOUS,"-"))]
+    # Make sure we followthrough the renewal flag for accounts with any policies up for renewal.
+    account_list[, RNL_MONTH_FLAG := sum(RNL_MONTH_FLAG) > 0,
+                 by = c("INSD_NM", "WRITN_YEAR")]
+  }
+  else{
+    account_list[, RNL_MONTH_FLAG := TRUE]
+  }
+  
+  # Summarize, using the most common value (mode), ignoring NAs.
+  account_list <- account_list[, lapply(.SD, CALC_MODE), by = c("INSD_NM", "WRITN_YEAR")][GWP > 0 & LEVELLED_GWP > 0]
+  
+  account_list$TENURE <- GET_HIST_VALUE(data_total = account_list,
+                                        data_for_summary = account_list,
+                                        summarizeBy = "INSD_NM",
+                                        column_to_summarize = "GWP",
+                                        sumval = FALSE,
+                                        numberYears = 6, 
+                                        includeCurrentYear = for_renewal)
+  
+  account_list$TENURE = account_list$LENGTH_OF_RELATIONSHIP
+  account_list[is.na(TENURE), TENURE := 0]
+  account_list$TENURE = ifelse(account_list$TENURE > 6, 6, account_list$TENURE)
+  
+  account_list[, AVG_CLAIM_COUNT_3YEAR := sum(HIST_CLAIM_COUNT_3YEAR, na.rm = T)/max(c(TENURE, 1)), by = c("INSD_NM", "WRITN_YEAR")]
+  
+  # Retrieve all the names of all the required features for these models
+  features_all <- unique(c(features_freq, features_sev))
+  
+  account_list$GWP <- account_list$LEVELLED_GWP
+  
+  for(col in features_all[which(!(features_all %in% names(account_list)))]){
+    if(col == "PREMIUM_BAND"){
+      account_list[, PREMIUM_BAND := PREMIUM_BANDING(LEVELLED_GWP)]
+    }
+    else if (col %like% "LOG_"){
+      str = substr(col, 1+nchar("LOG_"), nchar(col))
+      if(!is.null(account_list[[str]])){
+        # print(col)
+        account_list[[col]] = log10(1 + as.numeric(account_list[[str]]))
+      }
+      else
+        account_list[[col]] = NA
+    }
+  }
+  
+  # Fill in NAs before subsetting.
+  account_list <- FILL_NA(account_list, 
+                          summarizeBy = c("INSD_NM"),
+                          exceptions = c("HIST_LR_3YEAR", 
+                                         "LOG_CLAIM_COUNT_3YEAR ", 
+                                         "LOG_AVG_CLAIM_SIZE_3YEAR"))
+  return(account_list)
+}
+
+###### Section: GENERATE PREDICTIONS ######
+ASSIGN_PREDICTIONS <- function(LOB, model_list, data_list, pred_contrib = FALSE){
+  # This functions creates a fully-numeric matrix which the model is applied to.
+  # THe model list must have a $model of XgBoost model type.
+  # It must have $ohe_features which is a list of the OHE features for this model.
+  
+  # If pred_contrib == TRUE, then we get the prediciton contributions (i.e. the
+  # shap scores), rather than the prediction itself.
+  
+  input <- data_list
+  ohe_features <- model_list$ohe_features
+  model <- model_list$model
+  
+  for(factor in ohe_features){
+    if(!(factor %in% names(input))) next
+    input[[factor]] <- as.factor(input[[factor]])
+  }
+  
+  # Make any necessary adjustments per LOB,
+  # such as what DEVELOPMENT should be set to.
+  LINE_SPECIFIC_ADJUSTMENTS(LOB, input)
+  
+  DATA_ALL <- NULL
+  
+  tryCatch(
+    {
+      # We use trycatch in case we get the error that there aren't enough values in dummies.
+      dummies <- dummyVars(paste0("~ ", paste0(ohe_features, collapse = " + ")), data = input)
+      
+      DATA_OHE <- as.data.table(predict(dummies, newdata = input))
+      
+      DATA_ALL <- cbind(input[,-c(which(names(input) %in% ohe_features)), with = FALSE], DATA_OHE)
+    },
+    error = function(e){
+      DATA_ALL <- input[,-c(which(names(input) %in% ohe_features)), with = FALSE]
+    },
+    warning = function(w){
+      DATA_ALL <- input[,-c(which(names(input) %in% ohe_features)), with = FALSE]
+    }
+  )
+  if(is.null(DATA_ALL)){
+    DATA_ALL <- input[,-c(which(names(input) %in% ohe_features)), with = FALSE]
+  }
+  # Grab only the columns which are used in this model.
+  DATA_ALL <- DATA_ALL[,c(which(names(DATA_ALL) %in% model$feature_names)), with = FALSE]
+  # Create blank columns of the additional columns needed in model that were not found in this data.
+  missing_factors <- model$feature_names[!(model$feature_names %in% names(DATA_ALL))]
+  if(length(missing_factors) > 0) {
+    DATA_ALL[, (missing_factors) := 0]
+  }  
+  DATA_ALL = lapply(DATA_ALL, function(x){ifelse(is.na(x),0,as.numeric(x))})
+  # Re-order columns to correlate with set-order in model
+  setcolorder(DATA_ALL, model$feature_names)
+  DATA_ALL = as.data.table(DATA_ALL)
+  
+  if(!pred_contrib){
+    #DATA_ALL <- lapply(DATA_ALL, as.numeric)
+    
+    #print(as.matrix(DATA_ALL))
+    return(as.data.table(predict(model, xgb.DMatrix(data = as.matrix(DATA_ALL)))))
+    # return(predict(model, xgb.DMatrix(data = as.matrix(DATA_ALL), missing = 0)))
+  }
+  else{
+    return(as.data.table(predict(model, xgb.DMatrix(data = as.matrix(DATA_ALL)), 
+                                 predcontrib = TRUE, approxcontrib = FALSE)))
+  }
+}
+
+LINE_SPECIFIC_ADJUSTMENTS = function(LOB, DATA_ALL){
+  if(LOB == "MTR"){
+    DATA_ALL[, DEVELOPMENT := 6]
+    # For motor, we make sure it is not non-conventional
+    # if("LOB_SUB_GROUP_1.Non-Conventional" %in% names(DATA_ALL)){
+    #   DATA_ALL[, `LOB_SUB_GROUP_1.Non-Conventional` := 0]
+    # }
+  }
+  else if(LOB == "PRI"){
+    DATA_ALL[, DEVELOPMENT := 5]
+  }
+  else if(LOB == "PRC"){
+    DATA_ALL[, DEVELOPMENT := 1]
+  }
+  else if(LOB == "LIAB"){
+    DATA_ALL[, DEVELOPMENT := 6]
+  }
+  return(DATA_ALL)
+}
+
+ASSIGN_TIER <- function(predicted_LR, l_bound, m_bound){
+  ifelse(predicted_LR > m_bound, 3,
+         ifelse(predicted_LR > l_bound, 2,1))
+}
+ASSIGN_TIER_PCT <- function(data, pct){
+  pred <- data[order(predicted_LR)]
+  pred$cumsumGWP <- cumsum(pred$GWP)
+  l_bound <- pred[cumsumGWP <= pct[1]*sum(pred$GWP),max(predicted_LR)]
+  m_bound <- pred[cumsumGWP <= (pct[1]+pct[2])*sum(pred$GWP),max(predicted_LR)]
+  ifelse(data$predicted_LR <= l_bound, 1, 
+         ifelse(data$predicted_LR <= m_bound, 2, 3))
+}
+GET_TIER_PCT_THRESHOLDS <- function(data, pct){
+  pred <- data[order(predicted_LR)]
+  pred$cumsumGWP <- cumsum(pred$GWP)
+  l_bound <- pred[cumsumGWP <= pct[1]*sum(pred$GWP),max(predicted_LR)]
+  m_bound <- pred[cumsumGWP <= (pct[1]+pct[2])*sum(pred$GWP),max(predicted_LR)]
+  list("l_bound" = l_bound, "m_bound" = m_bound)
+}
+
+GENERATE_TIERED_ACCOUNT_LIST = function(account_list, LOB, 
+                                        freq_model_list, sev_model_list,
+                                        pred_LR_thresholds,
+                                        for_renewal = TRUE,
+                                        shap_scores = FALSE){
+  # Retrieve all the names of all the required features for these models
+  features_freq <- unique(as.vector(t(as.data.table(strsplit(freq_model_list$model$feature_names, "[.]"))[1])))
+  features_sev <- unique(as.vector(t(as.data.table(strsplit(sev_model_list$model$feature_names, "[.]"))[1])))
+  features_all <- unique(c(features_freq, features_sev))
+  
+  features_for_model <- c("CL_LOB_5", "INSD_NM", "INSURED", "POL_NUMBER", "WRITN_YEAR", "RNL_DATE", features_all)
+
+  if(for_renewal)
+    TIERING_DATA_ALL <- account_list[RNL_MONTH_FLAG == TRUE & GWP > 1, ..features_for_model]
+  else
+    TIERING_DATA_ALL <- account_list[GWP > 1]
+  
+  TIERING_DATA_ALL$GWP <- 10^(TIERING_DATA_ALL$LOG_GWP) 
+  TIERING_DATA_ALL$predicted_num_losses <- ASSIGN_PREDICTIONS(LOB, freq_model_list, TIERING_DATA_ALL)
+  TIERING_DATA_ALL$predicted_claim_size <- 10^(ASSIGN_PREDICTIONS(LOB, sev_model_list, TIERING_DATA_ALL)+1)
+  TIERING_DATA_ALL$predicted_incurred <- TIERING_DATA_ALL$predicted_num_losses * TIERING_DATA_ALL$predicted_claim_size
+  TIERING_DATA_ALL$predicted_LR <- TIERING_DATA_ALL$predicted_incurred / TIERING_DATA_ALL$GWP
+  
+  TIERING_DATA_ALL$pred_TIER <- ASSIGN_TIER(TIERING_DATA_ALL$predicted_LR, 
+                                            pred_LR_thresholds[["l_bound"]],
+                                            pred_LR_thresholds[["m_bound"]])
+  #TIERING_DATA_ALL$predicted_LR = TIERING_DATA_ALL$predicted_LR * 0.334
+  # if(LOB == "MTR"){
+  #   TIERING_DATA_ALL$predicted_LR = TIERING_DATA_ALL$predicted_LR * 0.348
+  # }
+  if (LOB == "PRI"){
+    TIERING_DATA_ALL[INSD_NM %like% "ZENNOR", pred_TIER := 3]
+  }
+  TIERING_DATA_ALL = GET_MAIN_DRIVERS(LOB, 
+                                      freq_model_list,
+                                      sev_model_list,
+                                      TIERING_DATA_ALL)
+  return(TIERING_DATA_ALL)
+}
+
+GET_MAIN_DRIVERS = function(LOB, freq_model_list, sev_model_list, data_list){
+  # Generates a list of the main features that are affecting the prediction.
+  # These are useful when the historical loss ratio is low, and the rate strength 
+  # is high, but the machine tier is high (i.e. tier 3). This helps to avoid
+  # some of the questions from underwriters (perhaps).
+  
+  # These contributions combine to the prediction by Prediction = exp(sum(scores))
+  # Because we train a severity as the log, its prediction is Prediction = 10**exp(sum(scores))
+  # Unfortunately, this means that we can't just add together the shap scores for both models.
+  # If both gave a standard prediction, we could do 
+  # TotalPrediciton = exp(sum(f_scores + s_scores))
+  # But, the severity model would be much less accurate.
+  
+  # To get the contribution to the prediction we can look at the prediction with and without 
+  # the factor.
+  # We can then take the greatest contributions by their percentage change to the prediction.
+  
+  freq_shap = ASSIGN_PREDICTIONS(LOB, freq_model_list, data_list, pred_contrib = TRUE)
+  sev_shap = ASSIGN_PREDICTIONS(LOB, sev_model_list, data_list, pred_contrib = TRUE)
+  
+  # By each factor, get the prediction with and without.
+  # There is probably a more efficient way to do this,
+  # but we'll just do a for loop over the index.
+  contributions = data.table(i = 1:dim(data_list)[1])
+  contributions[, freq_sum := rowSums(freq_shap)]
+  contributions[, sev_sum := rowSums(sev_shap)]
+  #contributions$prediction = exp(rowSums(freq_shap))*(10**exp(rowSums(sev_shap)))
+  contributions[, prediction := exp(freq_sum) * (10**exp(sev_sum))]
+  contributions[, GWP := 10^(data_list$LOG_GWP)]
+  # col_list = unique(c(names(freq_shap), names(sev_shap)))
+  # col_list = sapply(col_list, function(x){
+  #   str_split(x, "[.]")[[1]][1]
+  # })
+  for(col in unique(c(names(freq_shap), names(sev_shap)))){
+    # We get the ratio of the prediction with and without this factor.
+    # We look at the difference to the mean shap score, rather than
+    # absolute.
+    contributions[, 
+                  (col) := (prediction/GWP) -
+                  ((
+                    ifelse(rep(is.null(sev_shap[[col]]), dim(contributions)[1]), 
+                           10**exp(sev_sum),
+                           10**exp(sev_sum - sev_shap[[col]])
+                    ) * 
+                      ifelse(rep(is.null(freq_shap[[col]]), dim(contributions)[1]), 
+                             exp(freq_sum),
+                             exp(freq_sum - freq_shap[[col]])
+                      )
+                    )/GWP)
+                  ]
+  }
+  
+  # Remove the first three columns from contributions
+  contributions[, i := NULL]
+  contributions[, freq_sum := NULL]
+  contributions[, sev_sum := NULL]
+  contributions[, BIAS := NULL]
+  contributions[, prediction := NULL]
+  contributions[, GWP := NULL]
+  
+  if(!is.null(contributions[["DEVELOPMENT"]]))
+    contributions[, DEVELOPMENT := NULL]
+  
+  # We now get the major features. We look at what has the greatest percentage 
+  # change in prediciton.
+  
+  # We could take the top X features, or we could take any features over a threshold.
+  # Here we use the threshold approach.
+  # threshold = 0.5 # Major feature if it leads to a >20% change in prediciton.
+  data_list[, main_drivers := apply(contributions, 1, function(x){
+    # We go through each row and get the columns from contributions which 
+    # have a value over the threshold.
+    #names(contributions)[x >= threshold]
+    paste0(unique(sapply(names(contributions)[head(order(-x),3)], function(x){
+      str_replace_all(str_split(x, "[.]")[[1]][1], "LOG_", "")
+    })), collapse = ", ")
+  })]
+  return(data_list)
+}
+
+GENERATE_SHAP_LISTS = function(account_list, LOB, 
+                              freq_model_list, sev_model_list,
+                              for_renewal = TRUE){
+  # Retrieve all the names of all the required features for these models
+  features_freq <- unique(as.vector(t(as.data.table(strsplit(freq_model_list$model$feature_names, "[.]"))[1])))
+  features_sev <- unique(as.vector(t(as.data.table(strsplit(sev_model_list$model$feature_names, "[.]"))[1])))
+  features_all <- unique(c(features_freq, features_sev))
+  
+  features_for_model <- c("INSD_NM", "WRITN_YEAR", "CUST_ACCT_NUM", "RNL_DATE", features_all)
+  
+  if(for_renewal)
+    data_list <- account_list[RNL_MONTH_FLAG == TRUE & GWP > 1, ..features_for_model]
+  else
+    data_list <- account_list[GWP > 1]
+  
+  data_list$GWP <- 10^(data_list$LOG_GWP) 
+  
+  freq_shap = ASSIGN_PREDICTIONS(LOB, freq_model_list, data_list, pred_contrib = TRUE)
+  colnames(freq_shap) = paste0("freq_", colnames(freq_shap))
+  sev_shap = ASSIGN_PREDICTIONS(LOB, sev_model_list, data_list, pred_contrib = TRUE)
+  colnames(sev_shap) = paste0("sev_", colnames(sev_shap))
+  
+  return(cbind(freq_shap, sev_shap))
+}
+
+GENERATE_TIERING_OUTPUT = function(policy_list_all, TIERING_DATA_ALL, LOB, TIER_RNL_YEAR, TIER_RNL_MONTH){
+  if(TIER_RNL_MONTH != ""){
+    renewal_policies_tiered = policy_list_all[RNL_MONTH == as.numeric(paste0(TIER_RNL_YEAR, TIER_RNL_MONTH))]
+  }
+  else{
+    renewal_policies_tiered = policy_list_all[RNL_MONTH %like% TIER_RNL_YEAR]
+  }
+  historical_feature = "HIST_LR_3YEAR"
+  hist_feature_desc = "Account LR 3-year Non-CAT"
+  if(!(historical_feature %in% names(TIERING_DATA_ALL))){
+    historical_feature = "LOG_CLAIM_COUNT_3YEAR"
+    hist_feature_desc = "Account Claim Count 3-year"
+    TIERING_DATA_ALL[[historical_feature]] = 10**TIERING_DATA_ALL[[historical_feature]] - 1
+  }
+  
+  tiered_cols = c("INSD_NM", "WRITN_YEAR", "predicted_LR", "pred_TIER", "TENURE", "main_drivers", historical_feature)
+  
+  renewal_policies_tiered = merge(renewal_policies_tiered,
+                                   TIERING_DATA_ALL[,..tiered_cols],
+                                   by = c("INSD_NM", "WRITN_YEAR"),
+                                   all.x = T, all.y = F)
+  
+  # Remove lapsed policies
+  renewal_policies_tiered = renewal_policies_tiered[POLICY_OUTCOME != "Canc/Lapsed"]
+  
+  # LINE SPECIFIC FILTERING
+  renewal_policies_tiered = LINE_SPECIFIC_FILTERING_OUTPUT(renewal_policies_tiered, LOB)
+  
+  
+  
+  
+  renewal_policies_tiered = renewal_policies_tiered[order(-WRITN_YEAR)]
+  renewal_policies_tiered = renewal_policies_tiered[!duplicated(renewal_policies_tiered$POL_NUMBER)]
+  renewal_policies_tiered = renewal_policies_tiered[INSURED != ""]
+  
+  # Some non-ascii characters cause the file not to save to excel.
+  renewal_policies_tiered$INSURED = iconv(renewal_policies_tiered$INSURED, "UTF-8", "ASCII//TRANSLIT", sub="")
+  
+  renewal_policies_tiered[is.na(pred_TIER), pred_TIER := 2]
+  
+  renewal_policies_tiered[, MACHINE_TIER := paste0("Tier ", pred_TIER)]
+  
+  renewal_policies_tiered[, COMM_1YEAR_PCT := COMM / GWP_1YEAR]
+  renewal_policies_tiered[COMM_1YEAR_PCT < 0, COMM_1YEAR_PCT := 0]
+  renewal_policies_tiered[, COMM_3YEAR_PCT := COMM_3YEAR / CURRENT_3YEAR_GWP] 
+  renewal_policies_tiered[COMM_3YEAR_PCT < 0, COMM_3YEAR_PCT := 0]
+  
+  renewal_policies_tiered[, RNL_DATE := format(renewal_policies_tiered$RNL_DATE,
+                                             "%d-%b-%y")]
+  renewal_policies_tiered[, RNL_DATE_STR := as.character(renewal_policies_tiered$RNL_DATE)]
+  renewal_policies_tiered[is.na(RNL_DATE_STR), RNL_DATE_STR := paste0(format(INCEP_DATE,
+                                                               "%d-%b-"), substr(TIER_RNL_YEAR, 3, nchar(TIER_RNL_YEAR)))]
+  
+  
+  clean_NAs <- c("CURRENT_YEAR_INCURRED_WITH_CAT", "CLAIM_COUNT_1YEAR", "CURRENT_YEAR_LR_WITH_CAT", 
+                 "CURRENT_3YEAR_INCURRED_WITH_CAT", "CLAIM_COUNT_3YEAR", "CURRENT_3YEAR_LR_WITH_CAT")
+  
+  for(columnNA in clean_NAs){
+    renewal_policies_tiered[[columnNA]] <- ifelse(is.na(renewal_policies_tiered[[columnNA]]),
+                                                  0, renewal_policies_tiered[[columnNA]])
+  }
+  renewal_policies_tiered = renewal_policies_tiered[GWP > 1]
+  
+  output_cols <- c("CL_LOB_5",
+                   "INSURED",
+                   "POL_NUMBER",
+                   "UNDERWRITER",
+                   "RNL_DATE_STR",
+                   "TENURE",
+                   "GCS_SEGMENT",
+                   "POLARIS_NAME",
+                   "BROKERALL_CD",
+                   "AGENCY_REF",
+                   "GWP_1YEAR",
+                   "COMM_1YEAR_PCT",
+                   "CURRENT_YEAR_INCURRED_WITH_CAT",
+                   "CLAIM_COUNT_1YEAR",
+                   "CURRENT_YEAR_LR_WITH_CAT",
+                   "CURRENT_3YEAR_GWP",
+                   "COMM_3YEAR_PCT",
+                   "CURRENT_3YEAR_INCURRED_WITH_CAT",
+                   "CLAIM_COUNT_3YEAR",
+                   "CURRENT_3YEAR_LR_WITH_CAT",
+                   historical_feature,
+                   "RATE_CHANGE",
+                   "RATE_STRENGTH",
+                   "GCS_TIER",
+                   "MACHINE_TIER",
+                   "main_drivers"
+  )
+  
+  output_cols_renamed <- c("Line of Business",
+                           "Insured",
+                           "Policy Number",
+                           "Underwriter",
+                           "Next Renewal Date",
+                           "Length of Relationship (Years)",
+                           "GCS Segment",
+                           "Polaris Trade",
+                           "Broker",
+                           "Agency Reference",
+                           "Expiring GWP",
+                           "Expiring Commission",
+                           "Expiring Claim Incurred",
+                           "Expiring Claim Count",
+                           "Expiring Loss Ratio",
+                           "GWP 3-year",
+                           "Commission 3-year",
+                           "Claim Incurred 3-year",
+                           "Claim Count 3-year",
+                           "Loss Ratio 3-year",
+                           hist_feature_desc,
+                           "Rate Change",
+                           "Rate Strength",
+                           "Expiring Tier",
+                           "Machine Tier",
+                           "Major Factors"
+  )
+  
+  renewal_policies_tiered = renewal_policies_tiered[,..output_cols]
+  names(renewal_policies_tiered) = output_cols_renamed
+  # Add additional columns at the end that are blank.
+  renewal_policies_tiered[, `UW Tier` := NA]
+  renewal_policies_tiered[, `Rationale (If UW Tier is different to Machine Tier)` := NA]
+  renewal_policies_tiered[, `Remove from Tiering` := NA]
+  renewal_policies_tiered[, `Data Corrections` := NA]
+  
+  return(renewal_policies_tiered)
+}
+
+LINE_SPECIFIC_FILTERING_OUTPUT = function(output, LOB){
+  if(LOB == "PRI"){
+    # PRI:
+    # Remove terrorism policies.
+    output = output[!(POL_NUMBER %like% "TER")]
+    
+    # Remove schemes
+    schemes = as.data.table(read_xlsx("INPUTS/LOB/PRI/Scheme Agency References.xlsx"))
+    schemes = schemes[!is.na(`Agency Code`)][!(`Agency Name Full` %like% "CENTOR")]
+    
+    output = output[!(AGENCY_REF %in% schemes$`Agency Code`)]
+    
+    output[INSURED %like% "ZENNOR", INSURED := "ZENNOR"]
+    output[INSURED %like% "GRAYS INN" | INSURED %like% "WALLACE ESTATES", INSD_NM := "GRAYS INN / WALLACE ESTATES"]
+  }
+  else if(LOB == "PRC"){
+    # Need to update the UW field based on new allocation.
+    tracker = as.data.table(read_xlsx("INPUTS/LOB/PRC/PRC_UW_ALLOCATION.xlsx", sheet = "Master List"))
+    output$NEW_UW = sapply(output$POL_NUMBER, function(policyref){
+      if(dim(tracker[`Policy Number` == policyref])[1] > 0){
+          return(tracker[`Policy Number` == policyref]$`New UW`[1])
+      }
+      else return(NA)
+    })
+    output$UNDERWRITER = ifelse(!is.na(output$NEW_UW) & output$NEW_UW != "New Underwriter",
+                                output$NEW_UW, output$UNDERWRITER)
+  }
+  else if (LOB == "ENG"){
+    # Only show policies greater than 10k.
+    output = output[GWP_1YEAR >= 10e3]
+  }
+  return(output)
+}
+
+###### Section: CREATE WORKBOOK ######
+SAVE_TO_WORKBOOK = function(tiering_output, LOB_short, LOB_long, TIER_RNL_YEAR = "", TIER_RNL_MONTH = "", filename = ""){
+  wb = loadWorkbook("INPUTS/TIERING_TEMPLATE.xlsx")
+  sheetName = paste0(LOB_short,"_", toupper(month.abb[as.numeric(TIER_RNL_MONTH)]),substring(TIER_RNL_YEAR,3))
+  rownum = 2
+  
+  #addWorksheet(wb, sheetName = sheetName)
+  cloneWorksheet(wb, sheetName = sheetName, clonedSheet = "Data")
+  removeWorksheet(wb, "Data")
+  
+  format_percentage = createStyle(numFmt = "0%")
+  format_longnumber = createStyle(numFmt = "#,##0")
+  format_longdecimal = createStyle(numFmt = "0.000")
+  format_shortdecimal = createStyle(numFmt = "0.0")
+  format_output = createStyle(fgFill = "#FFEB9C", fontColour = "#9C5700", textDecoration = c("bold"))
+  format_input = createStyle(fgFill = "#FFCC99", fontColour = "#3F3F76")
+  format_right_border = createStyle(border = "right", borderStyle = "thin")
+  
+  title = paste0(LOB_long, " ", 
+                 toupper(month.abb[as.numeric(TIER_RNL_MONTH)]),
+                 " ",
+                 substring(TIER_RNL_YEAR,3),
+                 " Renewals")
+  
+  writeData(wb, sheet = sheetName, title)
+  
+  writeDataTable(wb, sheet = sheetName, x = tiering_output, startCol = 1, startRow = rownum, tableStyle = "TablestyleMedium2")
+
+  # Styles
+  decimal_cols = c()
+  short_decimal_cols = c()
+  longnum_cols = c(11, 13, 16, 18)
+  percent_cols = c(12, 15, 17, 20, 21, 22, 23)
+  output_cols = c(25,26)
+  input_cols = c(27,28,29,30)
+  right_border_cols = c(10, 15, 20, 21, 23)
+  
+  if(length(decimal_cols) > 0){
+    addStyle(wb, sheet = sheetName, style = format_longdecimal,
+             rows = (rownum + 1):(rownum + dim(tiering_output)[1]), cols = decimal_cols,
+             gridExpand = T, stack = T)
+  }
+  if(length(longnum_cols) > 0){
+    addStyle(wb, sheet = sheetName, style = format_longnumber,
+             rows = (rownum + 1):(rownum + dim(tiering_output)[1]), cols = longnum_cols,
+             gridExpand = T, stack = T)
+  }
+  if(length(percent_cols) > 0){
+    addStyle(wb, sheet = sheetName, style = format_percentage,
+             rows = (rownum + 1):(rownum + dim(tiering_output)[1]), cols = percent_cols,
+             gridExpand = T, stack = T)
+  }
+  if(length(short_decimal_cols) > 0){
+    addStyle(wb, sheet = sheetName, style = format_shortdecimal,
+             rows = (rownum + 1):(rownum + dim(tiering_output)[1]), cols = short_decimal_cols,
+             gridExpand = T, stack = T)
+  }
+  if(length(output_cols) > 0){
+    # Also change the column header
+    addStyle(wb, sheet = sheetName, style = format_output,
+             rows = (rownum):(rownum + dim(tiering_output)[1]), cols = output_cols,
+             gridExpand = T, stack = T)
+  }
+  if(length(input_cols) > 0){
+    addStyle(wb, sheet = sheetName, style = format_input,
+             rows = (rownum):(rownum + dim(tiering_output)[1]), cols = input_cols,
+             gridExpand = T, stack = T)
+  }
+  if(length(right_border_cols) > 0){
+    addStyle(wb, sheet = sheetName, style = format_right_border,
+             rows = (rownum):(rownum + dim(tiering_output)[1]), cols = right_border_cols,
+             gridExpand = T, stack = T)
+  }
+  
+  # Data Validation
+  dataValidation(wb, sheet = sheetName, 
+                 rows = (rownum+1):(rownum + dim(tiering_output)[1]), 
+                 cols = which(names(tiering_output) == "UW Tier"),
+                 type = "list",
+                 value = "'LISTS'!$A$2:$A$4")
+  dataValidation(wb, sheet = sheetName,
+                 rows = (rownum+1):(rownum + dim(tiering_output)[1]),
+                 cols = which(names(tiering_output) == "Remove from Tiering"),
+                 type = "list",
+                 value = "'LISTS'!$C$2:$C$2")
+
+  
+  # Revert back to prior filename  
+  output_filename = paste0(getwd(),
+                           "/OUTPUTS/",
+                           LOB_short,
+                           "/TIERING_",
+                           LOB_short,
+                           "_",
+                           ifelse(filename == "", "", paste0(filename, "_")),
+                           toupper(month.abb[as.numeric(TIER_RNL_MONTH)]),
+                           substr(as.character(TIER_RNL_YEAR),nchar(as.character(TIER_RNL_YEAR)) - 1, nchar(as.character(TIER_RNL_YEAR))),
+                           ".xlsx")
+  # output_filename = paste0(getwd(),
+  #                          "/OUTPUTS/",
+  #                          LOB_short,
+  #                          "/TIERING_",
+  #                          LOB_short,
+  #                          "_",
+  #                          ifelse(filename == "", "", paste0(filename, "_")),
+  #                          as.character(TIER_RNL_YEAR),
+  #                          ifelse(as.character(TIER_RNL_MONTH) != "","_",""),
+  #                          as.character(TIER_RNL_MONTH),
+  #                          ".xlsx")
+  
+  sheetVisibility(wb)[2] = "hidden"
+  worksheetOrder(wb) = c(3,1,2)
+  saveWorkbook(wb, file = output_filename, overwrite = TRUE)
+  print("Workbook saved.")
+}
+
+###### Section: FULL PROCESS ######
+LOB_TO_LineOfBusiness = function(LOB){
+  LOB_LIST = list(
+    "A&H" = "Accident and Health",
+    "POW" = "Conventional Power",
+    "LIAB" = "Corp Liability",
+    "MTR" = "Corp Motor",
+    "PRC" = "Corp Property (Non-Wholesale)",
+    "PRW" = "Corp Property (Wholesale)",
+    "CRI" = "Crime",
+    "CYB" = "Cyber",
+    "ENG" = "Engineering (ex. Power)",
+    "FI" = "Financial Institutions",
+    "CONINT" = "GCS Construction (International)",
+    "CONUK" = "GCS Construction (UK)",
+    "GCSO" = "GCS Other",
+    "LD" = "Latent Defects",
+    "LI" = "Legal Ind",
+    "MUK" = "Marine (UK)",
+    "MWH" = "Marine (Wholesale)",
+    "M&A" = "Mergers and Acquisitions",
+    "ML" = "Mgt Liab",
+    "PI" = "PI",
+    "PRI" = "Property Investors",
+    "REN" = "Renewables",
+    "SUR" = "Surety"
+  )
+  
+  if(is.null(LOB_LIST[[LOB]])){
+    stop(paste0("Invalid input (LOB): ", LOB))
+  }
+  else{
+    LineOfBusiness = LOB_LIST[[LOB]]
+  }
+  return(LineOfBusiness)
+}
+
+# Move to the process functions script.
+GET_TIERING_LIST_FULL = function(LOB,
+                            year_cutoff = 2015){
+  # Full process to run tiering for one month of renewal for 
+  # a single line of business.
+  
+  # This list gives the only allowable tiering LOBs.
+  # If the LOB is not within this list, it has no Smart 
+  # Tiering implementation so we throw an error.
+  
+  # To add a new line of business, create new folders in 
+  # INPUTS/MODELS and OUTPUTS. If additional data is needed
+  # in the tiering process, then a folder in INPUTS/LOB
+  # can be created and implementation added to any of the
+  # LINE_SPECIFIC_FILTER functions.
+  
+  LineOfBusiness = LOB_TO_LineOfBusiness(LOB)
+  
+  # Load models first since they are faster.
+  freq_model_list = LOAD_FREQ_MODEL(LOB)
+  print("(1/10) Frequency model loaded.")
+  sev_model_list = LOAD_SEV_MODEL(LOB)
+  print("(2/10) Severity model loaded.")
+  pred_LR_thresholds = LOAD_PRED_THRESHOLDS(LOB)
+  print("(3/10) Thresholds loaded.")
+  
+  target_year = 2021
+  
+  inflation = INFLATION_ASSUMPTIONS(inflation_assumptions_filename, target_year)
+  print("(4/10) Inflation assumptions loaded.")
+  DEBUG_PRINT(inflation)
+  
+  policy_list = GET_PREMIUM_DATA(LOB,
+                                 LineOfBusiness,
+                                 inflation,
+                                 year_cutoff)
+  print("(5/10) Premium data downloaded.")
+  DEBUG_PRINT(policy_list)
+  
+  claims_list = GET_CLAIMS_DATA(LOB,
+                                LineOfBusiness,
+                                inflation,
+                                year_cutoff)
+  print("(6/10) Claims data downloaded.")
+  DEBUG_PRINT(claims_list)
+  
+  policy_list_all = GENERATE_POLICY_LIST(policy_list = policy_list,
+                                         claims_list = claims_list,
+                                         import_RATE = GET_RATE_DATA(LineOfBusiness),
+                                         hist_megafile = GET_EXPERIAN_DATA())
+  
+  print("(7/10) Policy list generated.")
+  DEBUG_PRINT(policy_list_all)
+  
+  account_list = GENERATE_ACCOUNT_LIST_USING_MODEL_LIST(policy_list_all = policy_list_all, 
+                                                        claims_list = claims_list,
+                                                        year_cutoff = year_cutoff,
+                                                        freq_model_list = freq_model_list,
+                                                        sev_model_list = sev_model_list,
+                                                        TIER_RNL_YEAR = "", 
+                                                        TIER_RNL_MONTH = "")
+  print("(8/10) Account list generated.")
+  DEBUG_PRINT(account_list)
+  
+  TIERING_DATA_ALL = GENERATE_TIERED_ACCOUNT_LIST(account_list = account_list,
+                                                  LOB = LOB,
+                                                  freq_model_list = freq_model_list,
+                                                  sev_model_list = sev_model_list,
+                                                  pred_LR_thresholds = pred_LR_thresholds,
+                                                  for_renewal = FALSE)
+  print("(9/10) Account list tiered.")
+  return(TIERING_DATA_ALL)
+  
+  renewal_policies_tiered <- policy_list_all
+  
+  renewal_policies_tiered <- merge(renewal_policies_tiered,
+                                   TIERING_DATA_ALL[,.(INSD_NM, WRITN_YEAR, predicted_num_losses, predicted_claim_size, predicted_incurred, predicted_LR, pred_TIER, TENURE)],
+                                   by = c("INSD_NM", "WRITN_YEAR"),
+                                   all.x = T, all.y = F)
+  print("(10/10) Compelete")
+  return(renewal_policies_tiered)
+}
+
+RUN_FULL_GENERATE_TIERING_OUTPUT = function(LOB,
+                               TIER_RNL_YEAR, TIER_RNL_MONTH,
+                               year_cutoff = 2015,
+                               data_caching = FALSE){
+  # Full process to run tiering for one month of renewal for 
+  # a single line of business.
+  
+  # This list gives the only allowable tiering LOBs.
+  # If the LOB is not within this list, it has no Smart 
+  # Tiering implementation so we throw an error.
+  
+  # To add a new line of business, create new folders in 
+  # INPUTS/MODELS and OUTPUTS. If additional data is needed
+  # in the tiering process, then a folder in INPUTS/LOB
+  # can be created and implementation added to any of the
+  # LINE_SPECIFIC_FILTER functions.
+
+  LineOfBusiness = LOB_TO_LineOfBusiness(LOB)
+  
+  # Load models first since they are faster.
+  freq_model_list <<- LOAD_FREQ_MODEL(LOB)
+  print("(1/10) Frequency model loaded.")
+  sev_model_list <<- LOAD_SEV_MODEL(LOB)
+  print("(2/10) Severity model loaded.")
+  pred_LR_thresholds <<- LOAD_PRED_THRESHOLDS(LOB)
+  print("(3/10) Thresholds loaded.")
+  
+  target_year = as.numeric(TIER_RNL_YEAR)
+  if(is.na(target_year)){
+    stop(paste0("Invalid input (TIER_RNL_YEAR): ", TIER_RNL_YEAR))
+  }
+  
+  target_month = as.numeric(TIER_RNL_MONTH)
+  # if(is.na(as.numeric(TIER_RNL_MONTH)) | target_month < 1 | target_month > 12){
+  #   stop(paste0("Invalid input (TIER_RNL_MONTH): ", TIER_RNL_MONTH))
+  # }
+  
+  inflation = INFLATION_ASSUMPTIONS(inflation_assumptions_filename, target_year)
+  print("(4/10) Inflation assumptions loaded.")
+  DEBUG_PRINT(inflation)
+  
+  if(!data_caching | !exists("claims_list") | !exists("policy_list_all")){
+    policy_list = GET_PREMIUM_DATA(LOB,
+                                   LineOfBusiness,
+                                   inflation,
+                                   year_cutoff)
+    print("(5/10) Premium data downloaded.")
+    DEBUG_PRINT(policy_list)
+    
+    claims_list = GET_CLAIMS_DATA(LOB,
+                                  LineOfBusiness,
+                                  inflation,
+                                  year_cutoff)
+    claims_list <<- claims_list
+    print("(6/10) Claims data downloaded.")
+    DEBUG_PRINT(claims_list)
+    
+    policy_list_all = GENERATE_POLICY_LIST(policy_list = policy_list,
+                                           claims_list = claims_list,
+                                           import_RATE = GET_RATE_DATA(LineOfBusiness),
+                                           hist_megafile = GET_EXPERIAN_DATA())
+    policy_list_all <<- policy_list_all
+    print("(7/10) Policy list generated.")
+    DEBUG_PRINT(policy_list_all)
+  }
+  else{
+    print("(5/10) Premium data downloaded.")
+    print("(6/10) Claims data downloaded.")
+    print("(7/10) Policy list generated.")
+  }
+  
+  account_list = GENERATE_ACCOUNT_LIST_USING_MODEL_LIST(policy_list_all = policy_list_all, 
+                                                        claims_list = claims_list,
+                                                        year_cutoff = year_cutoff,
+                                                        freq_model_list = freq_model_list,
+                                                        sev_model_list = sev_model_list,
+                                                        TIER_RNL_YEAR = TIER_RNL_YEAR, 
+                                                        TIER_RNL_MONTH = TIER_RNL_MONTH)
+  print("(8/10) Account list generated.")
+  DEBUG_PRINT(account_list)
+  account_list <<- account_list
+  
+  TIERING_DATA_ALL = GENERATE_TIERED_ACCOUNT_LIST(account_list = account_list,
+                                                  LOB = LOB,
+                                                  freq_model_list = freq_model_list,
+                                                  sev_model_list = sev_model_list,
+                                                  pred_LR_thresholds = pred_LR_thresholds)
+  print("(9/10) Account list tiered.")
+  DEBUG_PRINT(TIERING_DATA_ALL)
+  TIERING_DATA_ALL <<- TIERING_DATA_ALL
+  
+  tiering_output = GENERATE_TIERING_OUTPUT(policy_list_all = policy_list_all,
+                                           TIERING_DATA_ALL = TIERING_DATA_ALL,
+                                           LOB,
+                                           TIER_RNL_YEAR = TIER_RNL_YEAR,
+                                           TIER_RNL_MONTH = TIER_RNL_MONTH)
+  return(tiering_output)
+}
+
+CREATE_GCSP_CONNECTION = function(){
+  # Grab a connection to the shared admin schema
+  if (!exists("gcsp_con") || is.null(gcsp_con)){
+    if (is.null(options("gcsp_password")$gcsp_password)){
+      key_set("GCSP") ; options(gcsp_password = key_get("GCSP")) 
+    }
+    gcsp_con <<- dbConnect(drv = odbc::odbc(), dsn = "GCSP", pwd = options("gcsp_password")$gcsp_password)
+  }
+  return(gcsp_con)
+}
+
+UPLOAD_TO_GCS_PRICING_SCHEMA = function(tiering_data){
+  # Push data to GCS Pricing schema
+  # tiering_data is expected to be the TIERING_DATA_ALL table.
+  
+  gcsp_con = CREATE_GCSP_CONNECTION()
+  
+  # Correct the format of the table
+  TIERING_DATA_ALL$TIMESTAMP = Sys.Date()
+  
+  # Push the table
+  dbWriteTable(gcsp_con, "GCS_PRICING.TIERING_GCS_OUTPUTS", data, append=T, row.names=F)
+  print("Uploaded to GCS Pricing Schema.")
+}
+
+RUN_TIERING_PROCESS = function(LOB,
+                               TIER_RNL_YEAR, TIER_RNL_MONTH,
+                               year_cutoff = 2015,
+                               data_caching = FALSE,
+                               save_to_db = TRUE){
+  
+  LineOfBusiness = LOB_TO_LineOfBusiness(LOB)
+  
+  tiering_output <<- RUN_FULL_GENERATE_TIERING_OUTPUT(
+    LOB = LOB, 
+    TIER_RNL_YEAR = TIER_RNL_YEAR,
+    TIER_RNL_MONTH = TIER_RNL_MONTH,
+    year_cutoff = year_cutoff,
+    data_caching = data_caching
     )
+  
+  if (save_to_db){
+    UPLOAD_TO_GCS_PRICING_SCHEMA(TIERING_DATA_ALL)
+  }
+  
+  SAVE_TO_WORKBOOK(tiering_output, 
+                   TIER_RNL_YEAR = TIER_RNL_YEAR,
+                   TIER_RNL_MONTH = TIER_RNL_MONTH,
+                   LOB, LineOfBusiness)
+  print(paste0("(10/10) Tiering process complete for ", LOB, " ", TIER_RNL_MONTH, "-", TIER_RNL_YEAR))
+}
+
+RUN_SHAP_PROCESS = function(LOB,
+                            TIER_RNL_YEAR, TIER_RNL_MONTH,
+                            year_cutoff = 2015,
+                            data_caching = FALSE){
+  # Full process to run tiering for one month of renewal for 
+  # a single line of business.
+  
+  # This list gives the only allowable tiering LOBs.
+  # If the LOB is not within this list, it has no Smart 
+  # Tiering implementation so we throw an error.
+  
+  # To add a new line of business, create new folders in 
+  # INPUTS/MODELS and OUTPUTS. If additional data is needed
+  # in the tiering process, then a folder in INPUTS/LOB
+  # can be created and implementation added to any of the
+  # LINE_SPECIFIC_FILTER functions.
+  LineOfBusiness = LOB_TO_LineOfBusiness(LOB)
+  
+  # Load models first since they are faster.
+  freq_model_list <<- LOAD_FREQ_MODEL(LOB)
+  print("(1/10) Frequency model loaded.")
+  sev_model_list <<- LOAD_SEV_MODEL(LOB)
+  print("(2/10) Severity model loaded.")
+  pred_LR_thresholds <<- LOAD_PRED_THRESHOLDS(LOB)
+  print("(3/10) Thresholds loaded.")
+  
+  target_year = as.numeric(TIER_RNL_YEAR)
+  if(is.na(target_year)){
+    stop(paste0("Invalid input (TIER_RNL_YEAR): ", TIER_RNL_YEAR))
+  }
+  
+  target_month = as.numeric(TIER_RNL_MONTH)
+  # if(is.na(as.numeric(TIER_RNL_MONTH)) | target_month < 1 | target_month > 12){
+  #   stop(paste0("Invalid input (TIER_RNL_MONTH): ", TIER_RNL_MONTH))
+  # }
+  
+  inflation = INFLATION_ASSUMPTIONS(inflation_assumptions_filename, target_year)
+  print("(4/10) Inflation assumptions loaded.")
+  DEBUG_PRINT(inflation)
+  
+  if(!data_caching | !exists("claims_list") | !exists("policy_list_all")){
+    policy_list = GET_PREMIUM_DATA(LOB,
+                                   LineOfBusiness,
+                                   inflation,
+                                   year_cutoff)
+    print("(5/10) Premium data downloaded.")
+    DEBUG_PRINT(policy_list)
     
-    # Print summary
-    freq_model.print_evaluation_summary()
+    claims_list = GET_CLAIMS_DATA(LOB,
+                                  LineOfBusiness,
+                                  inflation,
+                                  year_cutoff)
+    claims_list <<- claims_list
+    print("(6/10) Claims data downloaded.")
+    DEBUG_PRINT(claims_list)
     
-    # Save if path provided
-    if save_path:
-        freq_model.save_model(save_path)
-        print(f"\nModel saved to: {save_path}")
-    
-    return freq_model
+    policy_list_all = GENERATE_POLICY_LIST(policy_list = policy_list,
+                                           claims_list = claims_list,
+                                           import_RATE = GET_RATE_DATA(LineOfBusiness),
+                                           hist_megafile = GET_EXPERIAN_DATA())
+    policy_list_all <<- policy_list_all
+    print("(7/10) Policy list generated.")
+    DEBUG_PRINT(policy_list_all)
+  }
+  else{
+    print("(5/10) Premium data downloaded.")
+    print("(6/10) Claims data downloaded.")
+    print("(7/10) Policy list generated.")
+  }
+  
+  account_list = GENERATE_ACCOUNT_LIST_USING_MODEL_LIST(policy_list_all = policy_list_all, 
+                                                        claims_list = claims_list,
+                                                        year_cutoff = year_cutoff,
+                                                        freq_model_list = freq_model_list,
+                                                        sev_model_list = sev_model_list,
+                                                        TIER_RNL_YEAR = TIER_RNL_YEAR, 
+                                                        TIER_RNL_MONTH = TIER_RNL_MONTH)
+  
+  print("(8/10) Account list generated.")
+  DEBUG_PRINT(account_list)
+  account_list <<- account_list
+  
+  TIERING_DATA_ALL = GENERATE_TIERED_ACCOUNT_LIST(account_list = account_list,
+                                                  LOB = LOB,
+                                                  freq_model_list = freq_model_list,
+                                                  sev_model_list = sev_model_list,
+                                                  pred_LR_thresholds = pred_LR_thresholds)
+  
+  tiering_output <<- RUN_FULL_GENERATE_TIERING_OUTPUT(
+    LOB = LOB, 
+    TIER_RNL_YEAR = TIER_RNL_YEAR,
+    TIER_RNL_MONTH = TIER_RNL_MONTH,
+    year_cutoff = year_cutoff,
+    data_caching = data_caching
+  )
+  
+  SHAP_DATA = GENERATE_SHAP_LISTS(account_list = account_list,
+                                  LOB = LOB,
+                                  freq_model_list = freq_model_list,
+                                  sev_model_list = sev_model_list)
+  
+  SHAP_DATA_ALL = cbind(TIERING_DATA_ALL, SHAP_DATA)
+  
+  DEBUG_PRINT(SHAP_DATA_ALL)
+  
+  print("(9/10) Shap scores generated")
+  DEBUG_PRINT(SHAP_DATA_ALL)
+  TIERING_DATA_ALL <<- TIERING_DATA_ALL
+  
+  output_filename = paste0(getwd(),
+                           "/OUTPUTS/",
+                           LOB,
+                           "/TIERING_SHAP_",
+                           LOB,
+                           "_",
+                           as.character(TIER_RNL_YEAR),
+                           ifelse(as.character(TIER_RNL_MONTH) != "","_",""),
+                           as.character(TIER_RNL_MONTH),
+                           ".csv")
+  
+  write.csv(SHAP_DATA_ALL, output_filename, row.names=FALSE)
+  print("(10/10) Shap scores saved to file.")
+}
+
+###### Section: RUN MULTIPLE ######
+GET_TARGET_RENEWAL_YEAR_MONTH = function(delay){
+  current_month = month(Sys.Date())
+  current_year = year(Sys.Date())
+  if(current_month < 1 | current_month > 12){
+    stop("Invalid date generated.")
+  }
+  return(list(renewal_year = as.character(current_year + floor((current_month + delay - 1) / 12)),
+              renewal_month = str_pad(1 + (current_month + delay - 1)%%12, 2, pad = "0")))
+}
+RUN_TIERING_PROCESS_MULTIPLE = function(lines_with_delay, year_cutoff = 2015){
+  # Automated process to be run each month.
+  # Input is a list of LOBs along with the renewal delay.
+  # For example, PRI should be prepared 4 months in advance.
+  # The code would take the current month and add 4 to get
+  # the target renewal month.
+  
+  if(is.null(lines_with_delay) | !is.list(lines_with_delay)){
+    stop("Invalid input.")
+  }
+  
+  con = GET_CONNECTION()
+  
+  # lines_with_delay should be a list. The entries are
+  # the delays and the names are the LOBs.
+  prev_lob = ""
+  for(index in 1:length(lines_with_delay)){
+    print(paste0("Starting tiering process for ", 
+                 names(lines_with_delay)[index], " ",
+                 toupper(month.abb[as.numeric(GET_TARGET_RENEWAL_YEAR_MONTH(lines_with_delay[[index]])$renewal_month)]),
+                 "-",
+                 GET_TARGET_RENEWAL_YEAR_MONTH(lines_with_delay[[index]])$renewal_year, 
+                 "."
+                 ))
+    RUN_TIERING_PROCESS(LOB = names(lines_with_delay)[index], 
+                        TIER_RNL_YEAR = GET_TARGET_RENEWAL_YEAR_MONTH(lines_with_delay[[index]])$renewal_year, 
+                        TIER_RNL_MONTH = GET_TARGET_RENEWAL_YEAR_MONTH(lines_with_delay[[index]])$renewal_month,
+                        year_cutoff = year_cutoff, 
+                        data_caching = (prev_lob == names(lines_with_delay)[index]),
+                        save_to_db = FALSE)
+    prev_lob = names(lines_with_delay)[index]
+  }
+  print(paste0("Tiering sheets generated for ", paste0(names(lines_with_delay), collapse = ", "), "."))
+}
+
+###### Section: DEBUGGING ######
+SET_DEBUG_MODE = function(debug_on){
+  if(debug_on) {
+    assign("flag_debugging_is_on", TRUE, envir = .GlobalEnv)
+  }
+  else if(exists("flag_debugging_is_on")){
+    rm(flag_debugging_is_on, envir = .GlobalEnv)
+  }
+}
+DEBUG_PRINT = function(object){
+  if(exists("flag_debugging_is_on")) if(flag_debugging_is_on) print(object)
+}
+
+###### SECTION: EXPLAINERS ######
+SHAP_EXPLAINER <- function(search_name, search_year, model_list, data_list){
+  input <- data_list
+  input$PREMIUM_BAND <- PREMIUM_BANDING(input$GWP)
+  #input$HIST_LR_3YEAR <- as.factor(sapply(input$HIST_LR_3YEAR, function(x){LR_TO_TIER(x)}))
+  # Set development to maximum (4 years for gamma, 5 for poiss at the moment).
+  input$DEVELOPMENT <- max(input$DEVELOPMENT,na.rm=T)
+
+  ohe_features <- model_list$ohe_features
+  model <- model_list$model
+
+  for(factor in ohe_features){
+    input[[factor]] <- as.factor(input[[factor]])
+  }
+
+  dummies <- dummyVars(paste0("~ ", paste0(ohe_features, collapse = " + ")), data = input)
+
+  DATA_OHE <- as.data.table(predict(dummies, newdata = input))
+  DATA_ALL <- cbind(input[,-c(which(names(input) %in% ohe_features)), with = FALSE], DATA_OHE)
+
+  # Grab only the columns which are used in this model.
+  DATA_ALL <- DATA_ALL[,c(which(names(DATA_ALL) %in% model$feature_names)), with = FALSE]
+  # Create blank columns of the additional columns needed in model that were not found in this data.
+  missing_factors <- model$feature_names[!(model$feature_names %in% names(DATA_ALL))]
+  if(length(missing_factors) > 0) {
+    DATA_ALL[, (missing_factors) := 0]
+  }
+  # Redorder columns to correlate with set-order in model
+  setcolorder(DATA_ALL, model$feature_names)
+
+  case_num <- which(input$INSD_NM %like% search_name & input$WRITN_YEAR == search_year)[1]
+
+  print(input[case_num][,.(INSD_NM, WRITN_YEAR)])
+
+  shap_values <- predict(model, xgb.DMatrix(data = as.matrix(DATA_ALL)), predcontrib = TRUE, approxcontrib = F)
+  shap_explainer_pre <- data.table(factors = colnames(shap_values), Shap = apply(shap_values, 2, function(x){x[case_num]}))
+
+  freq_nought <- exp(sum(shap_explainer_pre$Shap))
+  sev_nought <- 10^(exp(sum(shap_explainer_pre$Shap)))
+
+  #shap_explainer_pre$Shap <- ifelse(shap_explainer_pre$factors == "BIAS", shap_explainer_pre$Shap, shap_explainer_pre$Shap)
+  shap_explainer <- data.table(factors = colnames(DATA_ALL))
+  shap_explainer$factors <- sapply(shap_explainer$factors, function(x){
+    str_split(x, "[.]")[[1]][1]
+  })
+  shap_explainer <- unique(shap_explainer)
+
+  shap_explainer$Shap <- sapply(shap_explainer$factors, function(x){
+    shap_explainer_pre[factors %like% x, sum(Shap, na.rm=T)]
+  })
+
+  shap_explainer <- shap_explainer[order(factors)]
+  #shap_explainer <- rbind(shap_explainer_pre[factors == "BIAS"], shap_explainer)
+  print(exp(shap_explainer[factor == "BIAS"]$Shap))
+  shap_explainer <- shap_explainer[!(factors %in% c("DEVELOPMENT" ,"BIAS"))]
+
+  shap_explainer$shap_sum <- cumsum(shap_explainer$Shap)
+
+  if(model_list$model$params$objective %like% "poisson"){
+    shap_explainer$end <- exp(shap_explainer$Shap)-1
+  }
+  else if (model_list$model$params$objective %like% "gamma"){
+    pred <- sev_nought ^ (exp(-shap_explainer$Shap) - 1)
+    shap_explainer$end <- (1 - pred)
+  }
+  else{
+    stop("Unknown objective in model.")
+  }
+
+
+
+  shap_explainer$start <- 0
+  #shap_explainer <- rbind(shap_explainer, data.table(factors = "PREDICTION", Shap = sum(shap_explainer$Shap,na.rm=T), shap_sum = sum(shap_explainer$Shap,na.rm=T),start = 0, end = exp(sum(shap_explainer_pre$Shap,na.rm=T))-1))
+  shap_explainer$factors <- as.factor(shap_explainer$factors)
+  shap_explainer$updown <- shap_explainer$Shap < 0
+  shap_explainer$id <- dim(shap_explainer)[1]:1
+
+  if(model$params$objective %like% "poiss"){
+    ggplot(shap_explainer, aes(y = factors, fill = updown)) +
+      geom_rect(aes(y = id, ymin = id - 0.45, ymax = id + 0.45, xmin = end, xmax = start)) +
+      scale_y_continuous(
+        expand=c(0,0),
+        limits = c(min(shap_explainer$id)-0.5,max(shap_explainer$id)+0.5),
+        breaks = c(unique(shap_explainer$id)),
+        labels =
+          c(as.character(unique(shap_explainer$factors)))) +
+      geom_vline(xintercept = 0) +
+      theme(legend.position = "none") +
+      # scale_x_continuous(limits=c(-0.8,0.8), breaks = c(seq(-0.8, 0.8, 0.2))) +
+      scale_x_continuous(limits=c(min(shap_explainer$end)-0.25,max(shap_explainer$end)+0.25),
+                         breaks = seq(floor((min(shap_explainer$end)-0.25)*2)/2,max(shap_explainer$end)+0.25, 0.25),
+                         labels = scales::percent)
+  }else{
+    ggplot(shap_explainer, aes(y = factors, fill = updown)) +
+      geom_rect(aes(y = id, ymin = id - 0.45, ymax = id + 0.45, xmin = end, xmax = start)) +
+      scale_y_continuous(
+        expand=c(0,0),
+        limits = c(min(shap_explainer$id)-0.5,max(shap_explainer$id)+0.5),
+        breaks = c(unique(shap_explainer$id)),
+        labels =
+          c(as.character(unique(shap_explainer$factors)))) +
+      geom_vline(xintercept = 0) +
+      theme(legend.position = "none") +
+      scale_x_continuous(limits=c(min(shap_explainer$end)-0.25,max(shap_explainer$end)+0.25),
+                         breaks = seq(floor((min(shap_explainer$end)-0.25)*2)/2,max(shap_explainer$end)+0.25, 0.25),
+                         labels = scales::percent) +
+      ggtitle(paste0("Prediction: ", round(10^exp(sum(shap_explainer_pre$Shap,na.rm=T)), 3)))
+  }
+}
+SHAP_EXPLAINER_INC <- function(search_name, search_year, freq_model_list, sev_model_list, data_list, LOB, LR_mod = 1, ticks = 0.25){
+  input <- data_list[INSD_NM %like% search_name & WRITN_YEAR == search_year]
+  #input$PREMIUM_BAND <- PREMIUM_BANDING(input$GWP)
+  #input$HIST_LR_3YEAR <- as.factor(sapply(input$HIST_LR_3YEAR, function(x){LR_TO_TIER(x)}))
+  # Set development to maximum (4 years for gamma, 5 for poiss at the moment).
+  # input$DEVELOPMENT <- max(input$DEVELOPMENT,na.rm=T)
+  # 
+  # ohe_features <- model_list_poiss$ohe_features
+  # model_poiss <- model_list_poiss$model
+  # model_gamma <- model_list_gamma$model
+  # 
+  # for(factor in ohe_features){
+  #   input[[factor]] <- as.factor(input[[factor]])
+  # }
+  # 
+  # dummies <- dummyVars(as.formula(paste0("~ ", paste0(ohe_features, collapse = " + "))), data = input)
+  # 
+  # 
+  # DATA_OHE <- as.data.table(predict(dummies, newdata = input))
+  # DATA_ALL <- cbind(input[,-c(which(names(input) %in% ohe_features)), with = FALSE], DATA_OHE)
+  # # Grab only the columns which are used in this model.
+  # DATA_ALL <- DATA_ALL[,c(which(names(DATA_ALL) %in% model_poiss$feature_names)), with = FALSE]
+  # # Create blank columns of the additional columns needed in model that were not found in this data.
+  # missing_factors <- model_poiss$feature_names[!(model_poiss$feature_names %in% names(DATA_ALL))]
+  # if(length(missing_factors) > 0) {
+  #   DATA_ALL[, (missing_factors) := 0]
+  # }
+  # # Redorder columns to correlate with set-order in model
+  # setcolorder(DATA_ALL, model_poiss$feature_names)
+  
+  data_list$DEVELOPMENT = 6
+  
+  freq_shap = ASSIGN_PREDICTIONS(LOB, freq_model_list, input, pred_contrib = TRUE)
+  sev_shap = ASSIGN_PREDICTIONS(LOB, sev_model_list, input, pred_contrib = TRUE)
+  
+  GWP = input[, sum(GWP)]
+  
+  # case_num <- which(input$INSD_NM %like% search_name & input$WRITN_YEAR == search_year)[1]
+  case_num = 1
+  # shap_values <- predict(model_poiss, xgb.DMatrix(data = as.matrix(DATA_ALL)), predcontrib = TRUE, approxcontrib = F)
+  shap_explainer_pre <- data.table(factors = colnames(freq_shap), Shap = apply(freq_shap, 2, function(x){x[case_num]}))
+  
+  #shap_explainer_pre$Shap <- ifelse(shap_explainer_pre$factors == "BIAS", shap_explainer_pre$Shap, shap_explainer_pre$Shap)
+  shap_explainer <- data.table(factors = colnames(freq_shap))
+  shap_explainer$factors <- sapply(shap_explainer$factors, function(x){
+    str_split(x, "[.]")[[1]][1]
+  })
+  shap_explainer <- unique(shap_explainer)
+
+  shap_explainer$Shap <- sapply(shap_explainer$factors, function(x){
+    shap_explainer_pre[factors %like% x, sum(Shap, na.rm=T)]
+  })
+
+  temp <- shap_explainer
+
+  freq_nought <- exp(sum(shap_explainer_pre[factors == "BIAS"]$Shap))
+  
+  # ohe_features <- model_list_gamma$ohe_features
+  # 
+  # for(factor in ohe_features){
+  #   input[[factor]] <- as.factor(input[[factor]])
+  # }
+  # 
+  # dummies <- dummyVars(as.formula(paste0("~ ", paste0(ohe_features, collapse = " + "))), data = input)
+  # 
+  # 
+  # DATA_OHE <- as.data.table(predict(dummies, newdata = input))
+  # DATA_ALL <- cbind(input[,-c(which(names(input) %in% ohe_features)), with = FALSE], DATA_OHE)
+  # # Grab only the columns which are used in this model.
+  # DATA_ALL <- DATA_ALL[,c(which(names(DATA_ALL) %in% model_gamma$feature_names)), with = FALSE]
+  # # Create blank columns of the additional columns needed in model that were not found in this data.
+  # missing_factors <- model_gamma$feature_names[!(model_gamma$feature_names %in% names(DATA_ALL))]
+  # if(length(missing_factors) > 0) {
+  #   DATA_ALL[, (missing_factors) := 0]
+  # }
+  # # Redorder columns to correlate with set-order in model
+  # setcolorder(DATA_ALL, model_gamma$feature_names)
+
+
+  # shap_values <- predict(model_gamma, xgb.DMatrix(data = as.matrix(DATA_ALL)), predcontrib = TRUE, approxcontrib = F)
+  shap_explainer_pre <- data.table(factors = colnames(sev_shap), Shap = apply(sev_shap, 2, function(x){x[case_num]}))
+
+  #shap_explainer_pre$Shap <- ifelse(shap_explainer_pre$factors == "BIAS", shap_explainer_pre$Shap, shap_explainer_pre$Shap)
+  shap_explainer <- data.table(factors = colnames(freq_shap))
+  shap_explainer$factors <- sapply(shap_explainer$factors, function(x){
+    str_split(x, "[.]")[[1]][1]
+  })
+  shap_explainer <- unique(shap_explainer)
+
+  shap_explainer$Shap <- sapply(shap_explainer$factors, function(x){
+    shap_explainer_pre[factors %like% x, sum(Shap, na.rm=T)]
+  })
+
+
+  sev_nought <- exp(sum(shap_explainer_pre[factors == "BIAS"]$Shap))
+
+  # shap_explainer <- rbind(shap_explainer, temp)
+  # shap_explainer <- shap_explainer[,.(Shap = sum(Shap)),by=factors]
+
+  # x is freq, y is severirt
+  shap_explainer <- merge(temp, shap_explainer, by = "factors", all = T)
+  shap_explainer$Shap.x <- ifelse(is.na(shap_explainer$Shap.x), 0, shap_explainer$Shap.x)
+  shap_explainer$Shap.y <- ifelse(is.na(shap_explainer$Shap.y), 0, shap_explainer$Shap.y)
+
+  shap_explainer <- shap_explainer[order(factors)]
+  #shap_explainer <- rbind(shap_explainer_pre[factors == "BIAS"], shap_explainer)
+
+  #shap_explainer <- shap_explainer[!(factors %in% c("DEVELOPMENT" ,"BIAS"))]
+
+  # shap_explainer$shap_sum <- cumsum(shap_explainer$Shap)
+
+  #shap_explainer <- shap_explainer[!(factors %in% c("LOG_GWP"))]
+  
+  # With log severity, we need to use partial differentiation dSi approx. dS/dxi * dxi and dS approx. sum(dSi)
+  # Here, the issue is that severity was trained as log10, so we use 10^ to get a prediction, so:
+  # // incurred_pred = exp(sum(Shap_freq)) * 10^exp(sum(Shap_sev))
+  # Which doesn't separate into pairs so easily. But we can differentiate, then they do become pairs since
+  # // dS/dxi = 10^exp(sum(Shap_sev)) * (exp(sum(Shap_freq)) * exp(sum(Shap_sev)) + 1)
+  # if we treat each shap score as dxi, such that the base score is 10^exp(0) * (2) = 20, then we can still use this graph.
+  # shap_explainer$end <- ((exp(sum(shap_explainer$Shap))+1)*(shap_explainer$Shap))
+  #Instead we take partial fractions.
+  # if take the ratio of the prediction with and without a shap score pair (s1,f1), we get
+  # pred2/pred1 = 10^(exp(S) * (exp(s1) - 1)) * exp(f1)
+  # We let sev_nought = exp(S) so that:
+  # shap_explainer$end <- ((10 ^ (sev_nought *(exp(shap_explainer$Shap.y) - 1)) * exp(shap_explainer$Shap.x)) - 1
+  pred <- ((10 ^ (sev_nought*(exp(shap_explainer$Shap.y) - 1))) * exp(shap_explainer$Shap.x))
+  # pred <- (10 ^ exp(-shap_explainer$Shap.y)) * exp(-shap_explainer$Shap.x)/GWP
+  prediction <- (10^sev_nought) * freq_nought/GWP
+  #shap_explainer$end <- input[case_num]$predicted_LR * (1 - pred)
+  # shap_explainer$end <- (1 - pred)
+  shap_explainer$end <- 0
+  
+  base_pred = (10 ^ exp(-shap_explainer[factors == "BIAS"]$Shap.y)) * exp(-shap_explainer[factors == "BIAS"]$Shap.x)/GWP
+  shap_explainer$start <- 0
+  shap_explainer$change  <- 1
+  
+  shap_explainer[factors == "BIAS", end := 0]
+  for(i in 2:dim(shap_explainer)[1]){
+    # shap_explainer[i]$start = shap_explainer[i - 1]$end
+    # shap_explainer[i]$change = pred[i]-1
+    # shap_explainer[i]$end = shap_explainer[i]$start+prediction*(pred[i]-1)
+    shap_explainer[i]$start = 0
+    shap_explainer[i]$change = pred[i]-1
+    shap_explainer[i]$end = (pred[i] -1)
+  }
+  
+  # This one only works when severity and frequency are the same mapping so that
+  # // incurred_pred = exp(sum(Shap_freq)) * exp(sum(Shap_sev))
+  #shap_explainer$end <- exp(shap_explainer$Shap)-1
+
+  # shap_explainer$start <- 0
+  #shap_explainer <- rbind(shap_explainer, data.table(factors = "PREDICTION", Shap = sum(shap_explainer$Shap,na.rm=T), shap_sum = sum(shap_explainer$Shap,na.rm=T),start = 0, end = exp(sum(shap_explainer_pre$Shap,na.rm=T))-1))
+  shap_explainer$factors <- as.factor(shap_explainer$factors)
+  shap_explainer$updown <- shap_explainer$change < 0
+  shap_explainer$id <- dim(shap_explainer)[1]:1
+
+  shap_explainer <- shap_explainer[!(factors %in% c("LOG_GWP", "BIAS"))]
+  # shap_explainer <- shap_explainer[!(factors %in% c("BIAS"))]
+
+  shap_explainer[factors == "BIAS", factors := "BASE"]
+  
+  ggplot(shap_explainer, aes(y = factors, fill = updown)) +
+    geom_rect(aes(y = id, ymin = id - 0.45, ymax = id + 0.45, xmin = end, xmax = start)) +
+    scale_y_continuous(
+      expand=c(0,0),
+      limits = c(min(shap_explainer$id)-0.5,max(shap_explainer$id)+0.5),
+      breaks = c(unique(shap_explainer$id)),
+      labels =
+        c(as.character(unique(shap_explainer$factors)))) +
+    geom_vline(xintercept = 0) +
+    theme(legend.position = "none") +
+    # scale_x_continuous(limits=c(-0.8,0.8), breaks = c(seq(-0.8, 0.8, 0.2))) +
+    scale_x_continuous(limits=c(min(shap_explainer$end)-ticks,max(shap_explainer$end)+ticks),
+                       breaks = seq(floor((min(shap_explainer$end)-ticks)*2)/2,max(shap_explainer$end)+ticks, ticks),
+                       labels = scales::percent) +
+    ggtitle(paste0(search_name,
+                   "   Pred. LR: ", paste0(round(100*input[case_num]$predicted_LR*LR_mod, 0), "%"),
+                   "   Pred. Tier: ", input[case_num]$pred_TIER))
+}
+
+
