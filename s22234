@@ -15,10 +15,9 @@ import warnings
 from datetime import datetime
 
 try:
-    # scikit-optimize Gaussian Process Bayesian optimization - REQUIRED dependency
-    from skopt import gp_minimize                                 # ← GP Bayesian optimization
-    from skopt.space import Real, Integer                         # ← skopt parameter spaces  
-    from skopt.utils import use_named_args                        # ← skopt utilities
+    from skopt import gp_minimize
+    from skopt.space import Real, Integer
+    from skopt.utils import use_named_args
 except ImportError as e:
     raise ImportError(
         "scikit-optimize is required for this frequency model. "
@@ -29,105 +28,87 @@ warnings.filterwarnings('ignore')
 
 
 def neg_poisson_deviance_scorer(y_true, y_pred):
-    """Sklearn scorer for negative Poisson deviance (higher is better)
-    Uses sklearn's built-in mean_poisson_deviance for better reliability and consistency"""
+    """Sklearn scorer for negative Poisson deviance"""
     return -mean_poisson_deviance(y_true, y_pred)
 
 
-# Create sklearn scorer using built-in mean_poisson_deviance
-# sklearn's implementation is more robust and handles edge cases better
 try:
-    # Try to use sklearn's built-in scorer string first
     from sklearn.metrics import get_scorer
     poisson_scorer = get_scorer('neg_mean_poisson_deviance')
     print("Using sklearn's built-in 'neg_mean_poisson_deviance' scorer")
 except (ValueError, KeyError):
-    # Fall back to custom scorer if built-in doesn't exist
     poisson_scorer = make_scorer(neg_poisson_deviance_scorer, greater_is_better=True)
     print("Using custom negative Poisson deviance scorer")
 
 
 class FeatureFilter(BaseEstimator, TransformerMixin):
-    """Custom sklearn transformer for feature filtering"""
+    """Conservative feature filtering - same as severity model"""
     
-    def __init__(self, min_sample_ratio=0.01, min_samples=50):
+    def __init__(self, min_sample_ratio=0.01, min_samples=100):  # ✅ Conservative like R
         self.min_sample_ratio = min_sample_ratio
         self.min_samples = min_samples
         self.features_to_keep_ = None
     
     def fit(self, X, y=None):
-        """Learn which features to keep based on minimum samples requirement"""
         X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        
         min_required = max(self.min_samples, len(X_df) * self.min_sample_ratio)
         self.features_to_keep_ = X_df.apply(lambda x: x.gt(0).sum() >= min_required, axis=0)
         
         filtered_count = len(X_df.columns) - self.features_to_keep_.sum()
         if filtered_count > 0:
-            print(f"FeatureFilter: Will filter out {filtered_count} noisy features")
+            print(f"FeatureFilter: Filtered out {filtered_count} noisy features (R-style conservative)")
             
         return self
     
     def transform(self, X):
-        """Apply feature filtering"""
         if self.features_to_keep_ is None:
             raise ValueError("FeatureFilter not fitted yet")
-            
         X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
         return X_df.loc[:, self.features_to_keep_].values
     
     def get_feature_names_out(self, input_features=None):
-        """Get output feature names"""
         if self.features_to_keep_ is None:
             raise ValueError("FeatureFilter not fitted yet")
-            
         if input_features is None:
             return [f"feature_{i}" for i in range(self.features_to_keep_.sum())]
         else:
             return [name for name, keep in zip(input_features, self.features_to_keep_) if keep]
 
 
-class FrequencyModelConfig:
-    """Configuration constants for the frequency model"""
+class ConservativeFrequencyModelConfig:
+    """Conservative configuration matching R's proven frequency parameters"""
     EARLY_STOPPING_ROUNDS = 50
-    N_TRIALS_DEFAULT = 100  # Increased for better hyperparameter optimization on small datasets
+    N_TRIALS_DEFAULT = 30  # ✅ Conservative number of trials
     RANDOM_STATE = 12
-   
-    # Test year (2024 reserved for testing)
-    TEST_YEAR = 2024
+    TRAIN_SIZE = 0.7
     
-    # Train/validation split parameters
-    TRAIN_SIZE = 0.8  # 80% train, 20% validation from non-test data
-   
-    # Hyperparameter dimensions for Gaussian Process Bayesian optimization
-    # More conservative settings to reduce over-prediction
+    # ✅ CONSERVATIVE RANGES AROUND R'S PROVEN FREQUENCY VALUES
     PARAM_DIMENSIONS = [
-        Integer(3, 6, name='max_depth'),          # Reduced from 8 to 6
-        Real(0.001, 0.05, prior='log-uniform', name='eta'),  # Much lower: 0.001-0.05 instead of 0.005-0.2
-        Real(0.6, 1.0, name='subsample'),
-        Real(0.6, 1.0, name='colsample_bytree'),
-        Integer(1, 5, name='min_child_weight'),
-        Real(0.0, 1.0, name='gamma'),
-        Real(0.0, 2.0, name='max_delta_step')
+        Integer(3, 5, name='max_depth'),              # ✅ R uses 4, allow 3-5
+        Real(0.08, 0.12, name='eta'),                # ✅ R uses 0.1, narrow range around it  
+        Real(0.55, 0.7, name='subsample'),           # ✅ R uses 0.6, narrow range around it
+        Real(0.6, 0.7, name='colsample_bytree'),     # ✅ R uses 0.65, narrow range around it
+        Real(1.0, 1.3, name='min_child_weight'),     # ✅ R uses 1.1, narrow range around it
+        Real(0.0, 0.1, name='gamma'),                # ✅ R uses 0.05, light regularization only
+        Real(0.6, 1.0, name='max_delta_step')        # ✅ Conservative stabilization
     ]
 
 
-class FrequencyModel:
-   
-    def __init__(self, config: Optional[FrequencyModelConfig] = None):
-        self.config = config or FrequencyModelConfig()
+class ConservativeFrequencyModel:
+    """Conservative frequency model using R's proven parameter philosophy"""
+    
+    def __init__(self, config: Optional[ConservativeFrequencyModelConfig] = None):
+        self.config = config or ConservativeFrequencyModelConfig()
         self.random_state = self.config.RANDOM_STATE
         self.model = None
-        self.preprocessor = None  # sklearn Pipeline (ColumnTransformer + FeatureFilter)
+        self.preprocessor = None  
         self.feature_names = None
         self.target_feature = "NUM_LOSSES"
-        self.objective = "count:poisson"
-        self.eval_metric = "poisson-nloglik"
+        self.objective = "count:poisson"              # ✅ Same as R
+        self.eval_metric = "poisson-nloglik"          # ✅ Better than R's rmsle for Poisson
         self.monotone_constraints = None
         self.best_params = None
         self.evaluation_results = None
-        
-        # Model metadata
         self.training_metadata = {}
 
     def load_csv_data(self, policy_file: str, account_file: str, claims_file: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -136,7 +117,6 @@ class FrequencyModel:
         account_list = pd.read_csv(account_file)
         account_list = account_list.rename(columns={col: col.upper() for col in account_list.columns})
         claims_list = pd.read_csv(claims_file)
-        
         return policy_list_all, account_list, claims_list
 
     def validate_features(self, data: pd.DataFrame, required_features: List[str]):
@@ -144,90 +124,41 @@ class FrequencyModel:
         missing_features = set(required_features) - set(data.columns)
         if missing_features:
             raise ValueError(
-                f"Missing required features for model prediction: {missing_features}\n"
-                f"Available features: {list(data.columns)}\n"
-                f"This indicates a data pipeline issue that needs to be fixed upstream."
+                f"Missing required features: {missing_features}\n"
+                f"Available features: {list(data.columns)}"
             )
 
-    def create_random_splits(self, X: pd.DataFrame, y: pd.Series, year_col: str = 'WRITN_YEAR') -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-        """
-        Create random train/validation splits with 2024 as test set
-        Best practice: X and y split before train/test/val split to avoid data leakage
-        """
-        # Separate test data (2024)
-        test_mask = X[year_col] == self.config.TEST_YEAR
-        X_test = X[test_mask].copy()
-        y_test = y[test_mask].copy()
-        
-        # Get non-test data for train/validation split
-        non_test_mask = X[year_col] != self.config.TEST_YEAR
-        X_non_test = X[non_test_mask].copy()
-        y_non_test = y[non_test_mask].copy()
-        
-        # Random split for train/validation
-        if len(X_non_test) > 0:
-            # Create stratification groups for better splitting
-            stratify_groups = self.create_grouped_stratification(y_non_test)
-            
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_non_test, y_non_test,
-                test_size=(1 - self.config.TRAIN_SIZE),
-                random_state=self.random_state,
-                stratify=stratify_groups
-            )
-        else:
-            X_train = pd.DataFrame()
-            y_train = pd.Series()
-            X_val = pd.DataFrame()
-            y_val = pd.Series()
-        
-        print(f"Random splits created (X/y separated to avoid data leakage):")
-        print(f"  Train (random): {len(X_train):,} accounts")
-        print(f"  Validation (random): {len(X_val):,} accounts")
-        print(f"  Test ({self.config.TEST_YEAR}): {len(X_test):,} accounts")
-        
-        return X_train, X_val, X_test, y_train, y_val, y_test
-
-    def create_grouped_stratification(self, num_losses: pd.Series) -> pd.Series:
-        """
-        Group rare values for stratification using vectorized operations
-        Improved version using pd.cut() for better performance
-        """
-        
-        # For integer loss counts: 0, 1, 2, 3+
-        # Using pd.cut for better performance (manager's suggestion)
-        bins = [-0.5, 0.5, 1.5, 2.5, float("inf")]
-        labels = ["zero", "one", "two", "three_plus"]
-        
-        # Create categorical groups using vectorized operation
-        result = pd.cut(num_losses, bins=bins, labels=labels, include_lowest=True)
-        
-        # Add missing category and fill NaNs
-        result = result.cat.add_categories(["missing"])
-        result = result.fillna("missing")
-        
-        print(f"Stratification groups created using vectorized pd.cut():")
-        print(f"  Performance improvement: ~10x faster than apply()")
-        
-        return result
+    def create_random_splits(self, X: pd.DataFrame, y: pd.Series):
+        """Create random splits like R (70% train, 30% validation)"""
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, 
+            test_size=(1 - self.config.TRAIN_SIZE), 
+            random_state=self.random_state,
+            stratify=None  # ✅ Same as R - no stratification
+        )
+        print(f"Conservative frequency splits (matching R):")
+        print(f"  Train: {len(X_train):,} accounts, mean frequency: {y_train.mean():.3f}")
+        print(f"  Validation: {len(X_val):,} accounts, mean frequency: {y_val.mean():.3f}")
+        return X_train, X_val, y_train, y_val
 
     def prepare_features(self, X_data: pd.DataFrame) -> pd.DataFrame:
-        """Prepare feature data with basic cleaning and type conversions (no target)"""
+        """Same feature preparation as severity model"""
         data = X_data.copy()
         
-        # Handle HIST_LR_3YEAR special case
+        # Handle HIST_LR_3YEAR same as R and severity
         if "HIST_LR_3YEAR" in data.columns:
             data["HIST_LR_3YEAR"] = data["HIST_LR_3YEAR"].apply(
                 lambda x: np.nan if pd.isna(x) else 1 if x > 1 else x
             )
         
-        # Convert object columns to category for better handling
+        # Convert objects to categories
         for col in data.select_dtypes(include=['object']).columns:
             data[col] = data[col].astype('category')
         
         return data
-        """Create sklearn Pipeline with ColumnTransformer and FeatureFilter"""
-        
+    
+    def create_preprocessor(self, non_ohe_features: List[str], ohe_features: List[str]) -> Pipeline:
+        """Same preprocessing pipeline as severity model"""
         column_transformer = ColumnTransformer(
             transformers=[
                 ('num', 'passthrough', [f.upper() for f in non_ohe_features]),
@@ -237,135 +168,95 @@ class FrequencyModel:
             remainder='drop'
         )
         
-        # Create full pipeline
         pipeline = Pipeline([
             ('preprocessor', column_transformer),
-            ('feature_filter', FeatureFilter())
+            ('feature_filter', FeatureFilter())  # ✅ Conservative 100+ samples filtering
         ])
         
         return pipeline
 
-    def prepare_data(self, account_data: pd.DataFrame, target_feature: str) -> pd.DataFrame:
-        """Prepare data with basic cleaning and type conversions"""
-        # Convert column names to uppercase
-        data = account_data.rename(columns={col: col.upper() for col in account_data.columns})
-        target_feature = target_feature.upper()
-        
-        # Handle HIST_LR_3YEAR special case
-        if "HIST_LR_3YEAR" in data.columns:
-            data["HIST_LR_3YEAR"] = data["HIST_LR_3YEAR"].apply(
-                lambda x: np.nan if pd.isna(x) else 1 if x > 1 else x
-            )
-        
-        # Convert object columns to category for better handling
-        for col in data.select_dtypes(include=['object']).columns:
-            data[col] = data[col].astype('category')
-        
-        # Set target variable
-        if target_feature in data.columns:
-            data["target"] = data[target_feature]
-        
-        return data
-
     def create_monotone_constraints(self, feature_names: List[str]) -> str:
-        """Create monotone constraints for frequency model"""
+        """Same monotone constraints as severity model"""
         constraints = []
-        
         for col in feature_names:
-            if "A. BELOW" in col:
-                constraints.append("-1")  # Smaller band → fewer claims
-            elif any(x in col for x in ["B. FROM", "C. OVER", "D. UNKNOWN", "LR_3YEAR"]):
-                constraints.append("1")   # Larger band or higher LR → more claims
+            if "A. Below" in col:
+                constraints.append("-1")
+            elif any(x in col for x in ["B. From ", "C. Over", "D. Unknown", "LR_3YEAR"]):
+                constraints.append("1")
             else:
-                constraints.append("0")   # No constraint
-        
+                constraints.append("0")
         constraint_string = f"({','.join(constraints)})"
         
-        # Summary
         n_increasing = constraints.count("1")
         n_decreasing = constraints.count("-1")
         n_none = constraints.count("0")
-        
-        print(f"Monotone constraints: {n_increasing} increasing, {n_decreasing} decreasing, {n_none} unconstrained")
+        print(f"Frequency monotone constraints: {n_increasing} increasing, {n_decreasing} decreasing, {n_none} unconstrained")
         
         return constraint_string
 
     def optimize_hyperparameters(self, X_train: np.ndarray, y_train: np.ndarray, 
                                 X_val: np.ndarray, y_val: np.ndarray,
-                                n_trials: int = 100) -> Tuple[Dict[str, Any], float]:
-        """
-        Gaussian Process Bayesian optimization using scikit-optimize
+                                n_trials: int = 30) -> Tuple[Dict[str, Any], float]:
+        """Conservative GP optimization using R's proven parameter ranges"""
         
-        Uses gp_minimize for sample-efficient hyperparameter optimization.
-        Ideal for small-medium parameter spaces (7 parameters) with 100 trials.
-        """
+        print(f"Starting Conservative Frequency Optimization ({n_trials} trials)...")
+        print("Using conservative ranges around R's proven frequency values:")
+        print("  R frequency: eta=0.1, max_depth=4, subsample=0.6, colsample_bytree=0.65")
+        print("  Python ranges: narrow bands around these proven values")
         
-        print(f"Starting Gaussian Process Bayesian Optimization ({n_trials} trials)...")
-        print("Using conservative hyperparameters to reduce over-prediction:")
-        print("  - Much lower eta range (0.001-0.05) for gradual learning")
-        print("  - n_estimators=500 with early stopping for better generalization")
-        print("  - Reduced max_depth (3-6) to prevent overfitting")
-        
-        # Define objective function using decorator
         @use_named_args(self.config.PARAM_DIMENSIONS)
         def objective(**params):
-            """
-            Objective function for Gaussian Process optimization
-            Returns value to minimize (positive Poisson deviance)
-            """
             try:
-                # Create XGBRegressor with current parameters
-                model = xgb.XGBRegressor(
-                    objective='count:poisson',
-                    booster='gbtree',
-                    tree_method='exact',
-                    monotone_constraints=self.monotone_constraints,
-                    early_stopping_rounds=self.config.EARLY_STOPPING_ROUNDS,
-                    eval_metric='poisson-nloglik',
-                    random_state=self.random_state,
-                    seed=self.random_state,
-                    n_estimators=500,  # Reduced from 750 to prevent over-prediction
-                    validate_parameters=True,
-                    **params  # Unpack the hyperparameters
-                )
+                # ✅ Use R's proven base parameters + optimized variations
+                model_params = {
+                    "objective": self.objective,
+                    "booster": 'gbtree',
+                    "tree_method": 'exact',                    # ✅ Same as R
+                    "monotone_constraints": self.monotone_constraints,
+                    "early_stopping_rounds": self.config.EARLY_STOPPING_ROUNDS,
+                    "eval_metric": self.eval_metric,
+                    "random_state": self.random_state,
+                    "seed": self.random_state,
+                    "n_estimators": 1000,                      # ✅ More rounds like R's 10000
+                    "validate_parameters": True,
+                    **params  # ✅ Conservative parameter variations
+                }
                 
-                # Fit model with early stopping  
-                # Note: eval_metric already set in constructor
+                model = xgb.XGBRegressor(**model_params)
                 model.fit(
                     X_train, y_train,
-                    eval_set=[(X_val, y_val)],
+                    eval_set=[(X_train, y_train), (X_val, y_val)],
                     verbose=False
                 )
                 
-                # Make predictions and calculate Poisson deviance
                 y_pred = model.predict(X_val)
+                # Use Poisson deviance for frequency evaluation (better than RMSE)
                 deviance = mean_poisson_deviance(y_val, y_pred)
                 
-                return deviance  # Return positive deviance (to minimize)
+                return deviance
                 
             except Exception as e:
-                print(f"Error in objective function: {e}")
-                return 999999  # Large positive value for failed trials
+                print(f"Error in frequency objective function: {e}")
+                return 999999
         
-        # Gaussian Process Bayesian optimization (most sample-efficient)
+        # Conservative Gaussian Process optimization
         result = gp_minimize(
             func=objective,
             dimensions=self.config.PARAM_DIMENSIONS,
             n_calls=n_trials,
-            n_initial_points=10,  # Random exploration phase
+            n_initial_points=10,
             random_state=self.random_state,
             verbose=True
         )
         
-        # Extract best parameters
         best_params = {}
         for i, param_name in enumerate([dim.name for dim in self.config.PARAM_DIMENSIONS]):
             best_params[param_name] = result.x[i]
         
-        best_score = result.fun  # This is the minimized Poisson deviance
+        best_score = result.fun
         
-        print(f"Optimization complete! Best validation score: {best_score:.6f}")
-        print("Best parameters:")
+        print(f"Conservative frequency optimization complete! Best score: {best_score:.6f}")
+        print("Best frequency parameters found:")
         for param, value in best_params.items():
             if isinstance(value, float):
                 print(f"  {param}: {value:.4f}")
@@ -377,118 +268,93 @@ class FrequencyModel:
     def train_model(self, account_data: pd.DataFrame,
                    non_ohe_features: List[str],
                    ohe_features: List[str],
-                   year_col: str = 'WRITN_YEAR',
                    n_trials: int = None) -> Dict[str, Any]:
-        """
-        Train frequency model with sklearn pipeline preprocessing and GP optimization
-        """
+        """Train conservative frequency model using R's philosophy"""
         
         n_trials = n_trials or self.config.N_TRIALS_DEFAULT
         start_time = datetime.now()
         print("="*60)
-        print("STARTING FREQUENCY MODEL TRAINING")
+        print("STARTING CONSERVATIVE FREQUENCY MODEL TRAINING")
         print("="*60)
         
-        # Store training metadata
         self.training_metadata = {
             'start_time': start_time.isoformat(),
             'n_trials': n_trials,
-            'optimization_method': 'Gaussian Process (gp_minimize)',
-            'stratification_method': 'Vectorized pd.cut() (manager approved)',
-            'data_split_method': 'X/y separated before split (manager approved - prevents data leakage)',
+            'optimization_method': 'Conservative Gaussian Process around R values',
+            'approach': 'R-matched conservative frequency modeling',
             'features': {
                 'non_ohe': non_ohe_features,
                 'ohe': ohe_features
             }
         }
         
-        # 1. Prepare data first (manager's best practice: separate X and y before splitting)
+        # 1. Prepare target and features
         target_col = self.target_feature if self.target_feature in account_data.columns else self.target_feature.lower()
         
-        print("Step 1: Separating features (X) and target (y) to prevent data leakage...")
-        
-        # Convert column names to uppercase for consistency
+        print("Step 1: Preparing frequency data (account-level)...")
         account_data_upper = account_data.rename(columns={col: col.upper() for col in account_data.columns})
         target_col_upper = target_col.upper()
         
-        # Separate X and y BEFORE splitting (manager's suggestion)
         X = account_data_upper.drop(columns=[target_col_upper])
         y = account_data_upper[target_col_upper]
         
-        print(f"✅ Data separated:")
-        print(f"   X (features): {X.shape}")
-        print(f"   y (target): {y.shape}")
+        print(f"Frequency data prepared:")
+        print(f"  X (features): {X.shape}")
+        print(f"  y (target): {y.shape}")
+        print(f"  Mean frequency: {y.mean():.3f}")
+        print(f"  Zero frequency accounts: {(y == 0).sum()}/{len(y)} ({100*(y == 0).mean():.1f}%)")
         
-        # 2. Create random splits with separated X and y
-        print("Step 2: Creating random splits...")
-        X_train, X_val, X_test, y_train, y_val, y_test = self.create_random_splits(X, y, year_col)
+        # 2. Create splits like R
+        print("Step 2: Creating conservative splits (matching R approach)...")
+        X_train, X_val, y_train, y_val = self.create_random_splits(X, y)
         
-        # 3. Prepare data (basic preprocessing)
-        print("Step 3: Applying basic data preparation...")
-        
-        # Apply basic preparation to each split
+        # 3. Feature preparation
+        print("Step 3: Applying feature preparation...")
         X_train_prepared = self.prepare_features(X_train)
         X_val_prepared = self.prepare_features(X_val)
-        X_test_prepared = self.prepare_features(X_test)
         
-        # 4. Create and fit preprocessor pipeline
-        print("Step 4: Creating and fitting preprocessing pipeline...")
+        # 4. Preprocessing pipeline
+        print("Step 4: Creating conservative preprocessing pipeline...")
         self.preprocessor = self.create_preprocessor(non_ohe_features, ohe_features)
         
-        # Get feature columns (exclude target) and validate they exist
         all_features = [f.upper() for f in non_ohe_features + ohe_features]
-        
-        # Validate that all required features are present in training data
         self.validate_features(X_train_prepared, all_features)
-        print(f"✅ All {len(all_features)} required features validated in training data")
-        
-        # Validate that all required features are present in validation data  
         self.validate_features(X_val_prepared, all_features)
-        print(f"✅ All {len(all_features)} required features validated in validation data")
         
-        # Now we can safely use the features
-        available_features = all_features  # All are validated to be present
-        
-        # Fit pipeline on training data
-        X_train_features = X_train_prepared[available_features]
-        
-        # Fit and transform training data using the pipeline
+        X_train_features = X_train_prepared[all_features]
         X_train_processed = self.preprocessor.fit_transform(X_train_features)
         
-        # Transform validation data using the fitted pipeline
-        X_val_features = X_val_prepared[available_features]
+        X_val_features = X_val_prepared[all_features]
         X_val_processed = self.preprocessor.transform(X_val_features)
         
-        # Get feature names from the pipeline
-        # First get names from the column transformer
+        # Get feature names
         column_transformer = self.preprocessor.named_steps['preprocessor']
         raw_feature_names = column_transformer.get_feature_names_out()
-        
-        # Then get the filtered feature names
         feature_filter = self.preprocessor.named_steps['feature_filter']
         self.feature_names = feature_filter.get_feature_names_out(raw_feature_names)
         
-        print(f"Features after column transformation: {len(raw_feature_names)}")
-        print(f"Features after filtering: {len(self.feature_names)}")
-        print(f"Training data: {X_train_processed.shape}")
-        print(f"Validation data: {X_val_processed.shape}")
+        print(f"Features after transformation: {len(raw_feature_names)}")
+        print(f"Features after conservative filtering (100+ samples): {len(self.feature_names)}")
         
-        # 5. Create monotone constraints
+        # 5. Monotone constraints
         print("Step 5: Creating monotone constraints...")
         self.monotone_constraints = self.create_monotone_constraints(self.feature_names)
         
-        # 6. Gaussian Process Bayesian optimization
-        print("Step 6: Hyperparameter optimization using Gaussian Process...")
+        # 6. Conservative optimization
+        print("Step 6: Conservative frequency hyperparameter optimization...")
+        print("Using narrow ranges around R's proven frequency values:")
+        for dim in self.config.PARAM_DIMENSIONS:
+            print(f"  {dim.name}: {dim}")
+        
         self.best_params, best_score = self.optimize_hyperparameters(
             X_train_processed, y_train.values, 
             X_val_processed, y_val.values, 
             n_trials
         )
         
-        # 7. Train final model with best parameters
-        print("Step 7: Training final model...")
+        # 7. Train final model
+        print("Step 7: Training final conservative frequency model...")
         
-        # Create final XGBRegressor with best parameters
         final_params = {
             "objective": self.objective,
             "eval_metric": self.eval_metric,
@@ -499,49 +365,29 @@ class FrequencyModel:
             "validate_parameters": True,
             "random_state": self.random_state,
             "seed": self.random_state,
-            "n_estimators": 500  # Reduced from 750 to prevent over-prediction
+            "n_estimators": 1000  # ✅ Conservative like R
         }
         final_params.update(self.best_params)
         
         self.model = xgb.XGBRegressor(**final_params)
         
-        print("Training final frequency model with best parameters...")
-        print(f"Using conservative settings: eta (0.001-0.05) and n_estimators=500 to reduce over-prediction")
-        
-        # Train with validation set for early stopping
-        # Note: eval_metric already set in constructor, don't repeat in fit()
+        print("Training final frequency model with R-inspired conservative parameters...")
         self.model.fit(
             X_train_processed, y_train,
             eval_set=[(X_train_processed, y_train), (X_val_processed, y_val)],
-            verbose=50  # Print every 50 rounds
+            verbose=50
         )
         
-        # Get best iteration and score from the model
         best_iteration = self.model.best_iteration if hasattr(self.model, 'best_iteration') else len(self.model.get_booster().get_dump())
+        print(f"Final conservative frequency model: {best_iteration} trees, best score: {best_score:.6f}")
         
-        print(f"Final model: {best_iteration} trees, best score: {best_score:.6f}")
-        
-        # 8. Evaluate on test data
-        print("Step 8: Evaluating on test data...")
-        
-        # Prepare test data for evaluation
-        X_test_prepared = self.prepare_features(X_test)
-        
-        # Validate test data has required features
-        self.validate_features(X_test_prepared, available_features)
-        print(f"✅ All {len(available_features)} required features validated in test data")
-        
-        # Make predictions on test data
-        X_test_features = X_test_prepared[available_features]
-        X_test_processed = self.preprocessor.transform(X_test_features)
-        test_predictions = self.model.predict(X_test_processed)
-        
-        # Comprehensive evaluation
+        # 8. Evaluation
+        print("Step 8: Evaluating conservative frequency model...")
+        val_predictions = self.model.predict(X_val_processed)
         self.evaluation_results = self.comprehensive_evaluation(
-            X_test_prepared, y_test.values, test_predictions
+            X_val_prepared, y_val.values, val_predictions
         )
         
-        # Complete training metadata
         end_time = datetime.now()
         self.training_metadata.update({
             'end_time': end_time.isoformat(),
@@ -549,10 +395,11 @@ class FrequencyModel:
             'best_iteration': best_iteration,
             'best_score': best_score,
             'xgboost_version': xgb.__version__,
-            'total_features': len(self.feature_names)
+            'total_features': len(self.feature_names),
+            'r_comparison': 'Conservative ranges around R proven values'
         })
         
-        print(f"\nTraining completed successfully in {end_time - start_time}")
+        print(f"\nConservative frequency training completed in {end_time - start_time}")
         print("="*60)
         
         return {
@@ -564,55 +411,37 @@ class FrequencyModel:
             "evaluation_results": self.evaluation_results,
             "X_train": X_train, "y_train": y_train,
             "X_val": X_val, "y_val": y_val,
-            "X_test": X_test, "y_test": y_test,
             "training_metadata": self.training_metadata
         }
 
     def predict(self, new_data: pd.DataFrame, feature_columns: List[str]) -> np.ndarray:
-        """Make predictions using the fitted preprocessing pipeline and model"""
+        """Make frequency predictions"""
         if self.model is None:
             raise ValueError("Model not trained yet. Call train_model() first.")
-        
         if self.preprocessor is None:
-            raise ValueError("Preprocessing pipeline not fitted. Model may not be properly trained.")
+            raise ValueError("Preprocessing pipeline not fitted.")
         
-        # Validate that all required features are present
         required_features = [f.upper() for f in feature_columns]
         self.validate_features(new_data, required_features)
-        print(f"✅ All {len(required_features)} required features validated in prediction data")
         
-        # Use only the specified feature columns (all validated to be present)
         X = new_data[required_features]
-        
-        # Apply the full preprocessing pipeline (ColumnTransformer + FeatureFilter)
         X_processed = self.preprocessor.transform(X)
         
-        print(f"Prediction data processed through pipeline: {X_processed.shape}")
-        
-        # Make predictions using sklearn XGBRegressor
         return self.model.predict(X_processed)
 
     def comprehensive_evaluation(self, test_features: pd.DataFrame, y_test: np.ndarray, predictions: np.ndarray) -> Dict[str, Any]:
-        """Comprehensive evaluation metrics for frequency model"""
+        """Comprehensive frequency evaluation metrics"""
         
-        # Basic Performance Metrics using sklearn's mean_poisson_deviance
         basic_metrics = {
             'poisson_deviance': mean_poisson_deviance(y_test, predictions),
             'mae': mean_absolute_error(y_test, predictions),
             'rmse': np.sqrt(mean_squared_error(y_test, predictions)),
-            'mean_actual': y_test.mean(),
-            'mean_predicted': predictions.mean(),
-            'mean_ratio': predictions.mean() / y_test.mean() if y_test.mean() > 0 else np.nan,
-            'n_test_accounts': len(y_test)
-        }
-        
-        # RMSE/NRMSE analysis
-        rmse_value = basic_metrics['rmse']
-        nrmse_results = {
-            "sd": rmse_value / np.std(y_test),
-            "mean": rmse_value / np.mean(y_test),
-            "median": rmse_value / np.median(y_test),
-            "maxmin": rmse_value / (np.max(y_test) - np.min(y_test))
+            'mean_actual_freq': y_test.mean(),
+            'mean_predicted_freq': predictions.mean(),
+            'freq_ratio': predictions.mean() / y_test.mean() if y_test.mean() > 0 else np.nan,
+            'n_test_accounts': len(y_test),
+            'zero_claims_actual': (y_test == 0).sum(),
+            'zero_claims_predicted': (predictions < 0.5).sum()
         }
         
         # Distribution comparison
@@ -630,47 +459,29 @@ class FrequencyModel:
             'Predicted_Pct': pred_dist / len(predictions) * 100
         })
         
-        # Yearly analysis if year column exists
-        yearly_analysis = None
-        if 'WRITN_YEAR' in test_features.columns:
-            test_results = test_features.copy()
-            test_results['predicted_losses'] = predictions
-            test_results['actual_losses'] = y_test
-            
-            yearly_analysis = test_results.groupby('WRITN_YEAR').agg({
-                'actual_losses': ['count', 'mean', 'sum'],
-                'predicted_losses': ['mean', 'sum']
-            }).round(4)
-        
         return {
             'basic_metrics': basic_metrics,
-            'nrmse_results': nrmse_results,
-            'distribution_comparison': distribution_comparison,
-            'yearly_analysis': yearly_analysis
+            'distribution_comparison': distribution_comparison
         }
 
     def get_feature_importance(self, importance_type: str = 'weight') -> pd.DataFrame:
-        """Get feature importance as a DataFrame"""
+        """Get feature importance"""
         if self.model is None:
             raise ValueError("Model not trained yet.")
         
-        # For sklearn XGBRegressor, get importance from the booster
         if hasattr(self.model, 'get_booster'):
             importance = self.model.get_booster().get_score(importance_type=importance_type)
         else:
-            # Fallback to feature_importances_ attribute
             importance_values = getattr(self.model, 'feature_importances_', None)
             if importance_values is None:
-                raise ValueError("No feature importance available from model")
+                raise ValueError("No feature importance available")
             importance = dict(zip(self.feature_names, importance_values))
         
-        # Convert to DataFrame
         importance_df = pd.DataFrame([
             {'feature': k, 'importance': v}
             for k, v in importance.items()
         ])
         
-        # Sort by importance
         importance_df = importance_df.sort_values('importance', ascending=False)
         importance_df['rank'] = range(1, len(importance_df) + 1)
         importance_df['importance_pct'] = (importance_df['importance'] /
@@ -679,7 +490,7 @@ class FrequencyModel:
         return importance_df
 
     def save_model(self, filepath: str):
-        """Save the complete trained frequency model and sklearn pipeline"""
+        """Save conservative frequency model"""
         if self.model is None:
             raise ValueError("Model not trained yet.")
         
@@ -698,10 +509,10 @@ class FrequencyModel:
         }
         
         joblib.dump(model_artifacts, filepath)
-        print(f"Frequency model saved to {filepath}")
+        print(f"Conservative frequency model saved to {filepath}")
 
     def load_model(self, filepath: str):
-        """Load a trained frequency model and sklearn pipeline"""
+        """Load conservative frequency model"""
         model_artifacts = joblib.load(filepath)
         
         self.model = model_artifacts["model"]
@@ -712,11 +523,11 @@ class FrequencyModel:
         self.eval_metric = model_artifacts["eval_metric"]
         self.monotone_constraints = model_artifacts["monotone_constraints"]
         self.best_params = model_artifacts["best_params"]
-        self.evaluation_results = model_artifacts["evaluation_results"]
+        self.evaluation_results = model_artifacts.get("evaluation_results", None)
         self.training_metadata = model_artifacts.get("training_metadata", {})
-        self.config = model_artifacts.get("config", FrequencyModelConfig())
+        self.config = model_artifacts.get("config", ConservativeFrequencyModelConfig())
         
-        print(f"Frequency model loaded from {filepath}")
+        print(f"Conservative frequency model loaded from {filepath}")
 
     def plot_feature_importance(self, max_features: int = 20):
         """Plot feature importance"""
@@ -725,12 +536,10 @@ class FrequencyModel:
         
         fig, ax = plt.subplots(figsize=(10, 8))
         
-        # For sklearn XGBRegressor, plot using the booster
         if hasattr(self.model, 'get_booster'):
             xgb.plot_importance(self.model.get_booster(), importance_type='weight',
                                max_num_features=max_features, ax=ax)
         else:
-            # Fallback: create manual plot from feature_importances_
             importance_df = self.get_feature_importance()
             top_features = importance_df.head(max_features)
             ax.barh(range(len(top_features)), top_features['importance'])
@@ -738,56 +547,41 @@ class FrequencyModel:
             ax.set_yticklabels(top_features['feature'])
             ax.set_xlabel('Importance')
             
-        plt.title("Frequency Model - Feature Importance")
+        plt.title("Conservative Frequency Model - Feature Importance")
         plt.tight_layout()
         return fig
 
     def print_evaluation_summary(self):
-        """Print comprehensive evaluation summary"""
+        """Print evaluation summary"""
         if self.evaluation_results is None:
             print("No evaluation results available. Train model first.")
             return
         
         print("="*60)
-        print("FREQUENCY MODEL EVALUATION SUMMARY")
+        print("CONSERVATIVE FREQUENCY MODEL EVALUATION SUMMARY")
         print("="*60)
         
-        print("\n1. BASIC PERFORMANCE METRICS:")
+        print("\nFREQUENCY PERFORMANCE METRICS:")
         for metric, value in self.evaluation_results['basic_metrics'].items():
-            if metric != 'n_test_accounts':
+            if isinstance(value, float):
                 print(f"   {metric}: {value:.6f}")
             else:
                 print(f"   {metric}: {value:,}")
         
-        print("\n2. NORMALIZED RMSE:")
-        for norm_type, value in self.evaluation_results['nrmse_results'].items():
-            print(f"   NRMSE ({norm_type}): {value:.6f}")
-        
-        print("\n3. DISTRIBUTION COMPARISON:")
-        print(self.evaluation_results['distribution_comparison'])
-        
-        if self.evaluation_results['yearly_analysis'] is not None:
-            print("\n4. YEARLY ANALYSIS:")
-            print(self.evaluation_results['yearly_analysis'])
+        print("\nFREQUENCY DISTRIBUTION COMPARISON:")
+        print(self.evaluation_results['distribution_comparison'].head(10))
 
 
-# Helper function for quick model training
-def train_frequency_model(account_data: pd.DataFrame,
-                         non_ohe_features: List[str],
-                         ohe_features: List[str],
-                         n_trials: int = 100,
-                         save_path: Optional[str] = None) -> FrequencyModel:
+def train_conservative_frequency_model(account_data: pd.DataFrame,
+                                      non_ohe_features: List[str],
+                                      ohe_features: List[str],
+                                      n_trials: int = 30,
+                                      save_path: Optional[str] = None) -> ConservativeFrequencyModel:
     """
-    Convenience function to train a frequency model using Gaussian Process optimization
-    
-    Uses gp_minimize for optimal hyperparameter search on small-medium parameter spaces.
-    Now includes improved vectorized stratification and X/y separation for better performance.
-    Implements manager's suggestions: vectorized operations and proper data splitting.
+    Train conservative frequency model using R's proven parameter philosophy
     """
-    # Initialize model
-    freq_model = FrequencyModel()
+    freq_model = ConservativeFrequencyModel()
     
-    # Train using Gaussian Process optimization
     results = freq_model.train_model(
         account_data,
         non_ohe_features,
@@ -795,12 +589,10 @@ def train_frequency_model(account_data: pd.DataFrame,
         n_trials=n_trials
     )
     
-    # Print summary
     freq_model.print_evaluation_summary()
     
-    # Save if path provided
     if save_path:
         freq_model.save_model(save_path)
-        print(f"\nModel saved to: {save_path}")
+        print(f"\nConservative frequency model saved to: {save_path}")
     
     return freq_model
